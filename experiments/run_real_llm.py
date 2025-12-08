@@ -1,107 +1,153 @@
-import torch
-import torch.nn as nn
-import math
-import libortho_ops  # 我们的 C++ 扩展
+import sys
+import os
+import time
+import traceback
 
-class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.05):
-        super().__init__()
-        self.in_features = original_layer.in_features
-        self.out_features = original_layer.out_features
-        self.ortho_ratio = ortho_ratio
-        
-        print(f"[Ortho] Decomposing layer {self.in_features}x{self.out_features}...")
-        
-        # 1. 获取原始权重 (FP16/FP32)
-        w_orig = original_layer.weight.data.float()
-        device = w_orig.device
-        
-        # 2. 模拟 INT4 量化 (Base Stream)
-        # 这是一个简单的 MinMax 量化实现，用于生成 Base
-        self.scales = (w_orig.abs().max(dim=1, keepdim=True)[0] / 7.0).to(torch.float32)
-        w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
-        w_base_recon = w_int4_sim * self.scales
-        
-        # 3. 计算残差 (Residual)
-        residual = w_orig - w_base_recon
-        
-        # 4. 提取正交流 (Ortho Stream) - 只有最大的 5% 残差被保留
-        # 这就是你的“高曲率/异常值”假设的近似
-        k = int(residual.numel() * ortho_ratio)
-        topk_vals, topk_indices = torch.topk(residual.abs().view(-1), k)
-        threshold = topk_vals.min()
-        
-        mask = residual.abs() >= threshold
-        w_ortho_sparse = residual * mask
-        
-        # 5. 打包数据 (Packing)
-        # Base: Pack int4 to uint8 (2 weights per byte)
-        # Note: This implies cols must be even.
-        w_int4_offset = (w_int4_sim + 8).to(torch.uint8) # map -7..7 to 1..15
-        # Packing logic: Low 4 bits = even col, High 4 bits = odd col
-        w_int4_low = w_int4_offset[:, 0::2]
-        w_int4_high = w_int4_offset[:, 1::2]
-        self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
-        
-        # Ortho: Convert to CSR format components
-        w_ortho_csr = w_ortho_sparse.to_sparse_csr()
-        self.ortho_vals = w_ortho_csr.values().to(torch.float16)
-        self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
-        self.ortho_ptr = w_ortho_csr.crow_indices().to(torch.int32)
-        
-        self.nnz = self.ortho_vals.numel()
-        self.alpha = 1.0 # 默认开启
-        
-        # Move everything to correct device/type
-        self.base_packed = self.base_packed.to(device)
-        self.scales = self.scales.to(device)
-        self.ortho_vals = self.ortho_vals.to(device)
-        self.ortho_indices = self.ortho_indices.to(device)
-        self.ortho_ptr = self.ortho_ptr.to(device)
+# 强制刷新缓冲区，确保在 crash 前能看到输出
+def log(msg):
+    print(f"[DEBUG] {msg}")
+    sys.stdout.flush()
 
-    def forward(self, x):
-        # 这里的输入 x 可能是 (Batch, Seq, Hidden)，我们需要展平或者循环
-        # 简单的做法：展平成 2D 矩阵进行计算，再 reshape 回去
-        original_shape = x.shape
-        x_flat = x.view(-1, self.in_features)
-        
-        out_flat = torch.zeros(x_flat.size(0), self.out_features, device=x.device, dtype=torch.float32)
-        
-        libortho_ops.forward(
-            x_flat,
-            self.base_packed,
-            self.scales.view(-1), # Flatten scales
-            self.ortho_vals,
-            self.ortho_indices,
-            self.ortho_ptr,
-            out_flat,
-            self.alpha,
-            self.out_features,
-            self.in_features,
-            self.nnz
+log("Script execution started.")
+log(f"Python executable: {sys.executable}")
+log(f"Current working directory: {os.getcwd()}")
+log(f"System path: {sys.path}")
+
+try:
+    log("Importing torch...")
+    import torch
+    log(f"Torch version: {torch.__version__}")
+    log(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        log(f"Current device: {torch.cuda.get_device_name(0)}")
+    
+    log("Importing transformers...")
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    log("Transformers imported.")
+except ImportError as e:
+    log(f"CRITICAL IMPORT ERROR: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+except Exception as e:
+    log(f"UNKNOWN ERROR DURING IMPORTS: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+# 设置路径
+try:
+    current_file = os.path.abspath(__file__)
+    current_dir = os.path.dirname(current_file)
+    src_path = os.path.abspath(os.path.join(current_dir, '../src'))
+    log(f"Calculated src path: {src_path}")
+    
+    if src_path not in sys.path:
+        sys.path.append(src_path)
+        log("Added src path to sys.path")
+    
+    log(f"Checking if {src_path} exists: {os.path.exists(src_path)}")
+    log(f"Listing src dir: {os.listdir(src_path) if os.path.exists(src_path) else 'NOT FOUND'}")
+except Exception as e:
+    log(f"Path setup failed: {e}")
+    sys.exit(1)
+
+# 尝试导入 libortho 相关的模块
+try:
+    log("Attempting to import model_patch...")
+    # 延迟导入以捕获特定错误
+    import model_patch
+    log(f"model_patch imported from: {model_patch.__file__}")
+    from model_patch import replace_linear_layers, OrthoLinear
+    log("OrthoLinear class imported.")
+except ImportError as e:
+    log(f"FAILED to import model_patch. Check if libortho_ops is compiled correctly.")
+    log(f"Error details: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+except Exception as e:
+    log(f"Unexpected error importing model_patch: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+def main():
+    log("Entering main function")
+    print("--- LibOrtho Real LLM Experiment on GTX 4050 (DEBUG MODE) ---")
+    
+    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    log(f"Target Model: {model_id}")
+    
+    # 1. 加载 Tokenizer
+    try:
+        log("Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        log("Tokenizer loaded successfully.")
+    except Exception as e:
+        log(f"Failed to load tokenizer: {e}")
+        return
+
+    # 2. 加载模型
+    try:
+        log("Loading model (FP16)... this might take a while.")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16, 
+            device_map="cuda"
         )
-        
-        return out_flat.view(original_shape[:-1] + (self.out_features,))
+        log("Model loaded to GPU.")
+        log(f"Model memory footprint: {model.get_memory_footprint() / 1024**3:.2f} GB")
+    except Exception as e:
+        log(f"Failed to load model: {e}")
+        traceback.print_exc()
+        return
+    
+    # 3. 基准测试
+    prompt = "The capital of France is"
+    log(f"Running baseline generation with prompt: '{prompt}'")
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+        output = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        res = tokenizer.decode(output[0], skip_special_tokens=True)
+        print(f"\n[Original] Output: {res}")
+    except Exception as e:
+        log(f"Baseline generation failed: {e}")
+        traceback.print_exc()
 
-    def set_privacy(self, enable_ortho: bool):
-        self.alpha = 1.0 if enable_ortho else 0.0
+    # 4. 手术
+    log("Starting surgery (Layer Replacement)...")
+    try:
+        model = replace_linear_layers(model, target_modules=["down_proj"], ratio=0.1)
+        log("Surgery complete. Moving model to CUDA to ensure consistency.")
+        model.to("cuda")
+    except Exception as e:
+        log(f"Surgery failed: {e}")
+        traceback.print_exc()
+        return
 
-def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    """
-    递归替换模型中的 Linear 层
-    只替换 MLP 的输出层或者 Attention 的输出层通常就足够验证效果了，
-    而且能节省显存。
-    """
-    for name, module in model.named_children():
-        if len(list(module.children())) > 0:
-            replace_linear_layers(module, target_modules, ratio)
+    # 5. 测试 Alpha = 1.0
+    log("Testing Alpha=1.0...")
+    try:
+        for m in model.modules():
+            if isinstance(m, OrthoLinear): m.set_privacy(True)
         
-        if isinstance(module, nn.Linear):
-            # 检查名字是否匹配 (例如只替换 MLP 的 down projection)
-            # 这通常是知识存储最密集的地方
-            should_replace = any(t in name for t in target_modules)
-            if should_replace:
-                print(f"Patching layer: {name}")
-                new_layer = OrthoLinear(module, ortho_ratio=ratio)
-                setattr(model, name, new_layer)
-    return model
+        output = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        print(f"[Alpha=1.0] Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
+    except Exception as e:
+        log(f"Alpha=1.0 generation failed: {e}")
+        traceback.print_exc()
+
+    # 6. 测试 Alpha = 0.0
+    log("Testing Alpha=0.0 (Privacy Mode)...")
+    try:
+        for m in model.modules():
+            if isinstance(m, OrthoLinear): m.set_privacy(False)
+            
+        output = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        print(f"[Alpha=0.0] Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
+    except Exception as e:
+        log(f"Alpha=0.0 generation failed: {e}")
+        traceback.print_exc()
+
+    log("Experiment finished successfully.")
+
+if __name__ == "__main__":
+    log("__name__ == '__main__' check passed.")
+    main()
