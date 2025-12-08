@@ -1,5 +1,4 @@
-torch>=2.0.0
-numpy
-scipy
-matplotlib
-
+transformers>=4.30.0
+accelerate
+sentencepiece
+protobuf
