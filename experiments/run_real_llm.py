@@ -72,7 +72,7 @@ def main():
     log("Entering main function")
     print("--- LibOrtho Real LLM Experiment on GTX 4050 (DEBUG MODE) ---")
     
-    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_id = "/home/mpcblock/models/TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     log(f"Target Model: {model_id}")
     
     # 1. 加载 Tokenizer

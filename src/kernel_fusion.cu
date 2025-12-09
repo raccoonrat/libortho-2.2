@@ -4,6 +4,9 @@
  * We do NOT break userspace. The user calls a matrix multiplication, 
  * they get a matrix multiplication. They don't need to know about 
  * the underlying manifold separation inside the kernel dispatch.
+ * ---
+ * Fixed the quantization math. 
+ * Comments don't compile. Math does.
  */
 
 #include <cuda_runtime.h>
@@ -12,7 +15,7 @@
 
 // Helper for quantization unpacking
 __device__ __forceinline__ float unpack_int4(uint8_t packed, int idx) {
-    // Simple bit manipulation. Fast.
+    // Returns value in range [0, 15]
     return (idx % 2 == 0) ? (float)(packed & 0x0F) : (float)(packed >> 4);
 }
 
@@ -41,11 +44,21 @@ __global__ void dual_stream_gemm_kernel(
     if (row < rows) {
         float acc = 0.0f;
 
+        // 0. Load the scale for this row
+        // In our Python patch, scales are per-output-channel (per row)
+        float row_scale = scales[row];
+        float zero_point = 8.0f; // We shifted by +8 in Python
+
         // 1. Base Stream (Dense) - The heavy lifting
         // Using vector loads in real code, simplified here.
         for (int k = 0; k < cols; ++k) {
             uint8_t packed = base_data[(row * cols + k) / 2];
-            float w_base = unpack_int4(packed, k); // Apply scales/zeros here
+            float raw_val = unpack_int4(packed, k); 
+
+            // LINUS FIX: Actually apply the math this time.
+            // w_real = (w_quant - zero) * scale
+            float w_base = (raw_val - zero_point) * row_scale;
+
             acc += w_base * input[k];
         }
 
