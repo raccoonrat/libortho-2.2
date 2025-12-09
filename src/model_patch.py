@@ -15,46 +15,36 @@ class OrthoLinear(nn.Module):
         device = w_orig.device
         
         # 2. 模拟 INT4 量化 (Base Stream)
-        # LINUS FIX: 预算匹配 (Budget Matching)
-        # 停止猜测分布（Laplacian? Gaussian? Who cares?）。
-        # 我们有固定的 Ortho 预算 (ortho_ratio)。
-        # 我们必须设置 Scale，使得正好只有 ortho_ratio 比例的权重溢出 Base Range。
-        # 如果我们猜一个阈值（比如 Mean*6）导致 10% 的权重溢出，
-        # 而 Ortho 只能接住 0.5%，那剩下的 9.5% 就被永久破坏了 -> PPL 6000。
-        # 
-        # 解决方案：计算精确的 (1 - ratio) 分位数作为 Scale 基准。
+        # LINUS FIX: 回归 Max Scaling。
+        # 之前的教训：试图通过截断 Outliers 来提高分辨率是自杀行为。
+        # LLM 的 Outliers 是结构性的，必须在 Base 中保留其幅度。
+        # 我们使用每行的绝对最大值作为 Scale。
+        # 这样 Base Stream 就是一个标准的、可用的 INT4 模型。
         
         w_abs = w_orig.abs()
         
-        # 计算目标分位数索引
-        # 例如 ratio=0.005 (0.5%) -> target=0.995
-        # 这意味着 99.5% 的权重将完美适配 Base Stream，只有 0.5% 溢出
-        target_quantile = 1.0 - self.ortho_ratio
-        k_idx = int(self.in_features * target_quantile)
+        # 每一行的最大值。
+        # 这里的 dim=1 是输入特征维度。
+        robust_max = w_abs.max(dim=1, keepdim=True)[0]
         
-        # 边界安全检查
-        k_idx = max(1, min(k_idx, self.in_features - 1))
-        
-        # 使用 kthvalue 找到该分位数的具体数值
-        # 注意：这是对每一行（输出通道）独立计算的
-        robust_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
-        
-        # 防止全零层导致的除零
+        # 防止全零层
         robust_max.clamp_(min=1e-6)
         
-        # Range [-7, 7] 对应 robust_max
-        # 这样，<= robust_max 的权重会被精确量化
-        # > robust_max 的权重会被 Clamp，产生大残差，正好被 Ortho 捕获
+        # Range [-7, 7] 映射到 Max
         self.scales = (robust_max / 7.0).to(torch.float32)
         
         # 量化并截断
+        # 因为我们用了 Max Scaling，理论上只会正好触达 -7/7，不会有溢出截断。
         w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 3. 计算残差
+        # 现在的残差主要是量化噪声（Quantization Noise），
+        # 对于 Outliers 来说，残差是它损失的精度（Precision）。
         residual = w_orig - w_base_recon
         
         # 4. 提取正交流 (Ortho Stream)
+        # 我们保留最大的那些量化误差。
         k = int(residual.numel() * ortho_ratio)
         k = max(k, 1)
         
@@ -133,4 +123,4 @@ def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0
     print(f"[LibOrtho] Starting surgery on {target_modules} with ratio={ratio}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho] Surgery complete.")
-    return model
+    return model    
