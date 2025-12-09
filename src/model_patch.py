@@ -4,13 +4,22 @@ import math
 import libortho_ops  # 我们的 C++ 扩展
 
 class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.05):
+    def __init__(self, original_layer, ortho_ratio=0.05, fisher_info=None):
+        """
+        Args:
+            original_layer: 原始 Linear 层
+            ortho_ratio: Ortho 流的比例（残差的 top-k%）
+            fisher_info: 可选的 Fisher Information 张量，用于曲率加权筛选
+        """
         super().__init__()
         self.in_features = original_layer.in_features
         self.out_features = original_layer.out_features
         self.ortho_ratio = ortho_ratio
+        self.fisher_info = fisher_info
         
         print(f"[Ortho] Decomposing layer {self.in_features}x{self.out_features}...")
+        if fisher_info is not None:
+            print(f"[Ortho] Using Fisher Information for curvature-weighted selection.")
         
         # 1. 获取原始权重 (FP16/FP32)
         w_orig = original_layer.weight.data.float()
@@ -44,14 +53,31 @@ class OrthoLinear(nn.Module):
         residual = w_orig - w_base_recon
         
         # 4. 提取正交流 (Ortho Stream) - 只有最大的 % 残差被保留
+        # LINUS FIX: 如果提供了 Fisher Information，使用曲率加权筛选
+        if self.fisher_info is not None:
+            # 使用 Score_i = w_i^2 * F_ii 进行加权
+            # 确保 fisher_info 的形状匹配
+            if self.fisher_info.shape == w_orig.shape:
+                # 计算曲率加权的残差重要性
+                # metric = residual^2 * fisher_info (近似 w^2 * H)
+                metric = (residual ** 2) * self.fisher_info
+            else:
+                # 如果形状不匹配，回退到幅度筛选
+                print(f"[Warn] Fisher shape mismatch: {self.fisher_info.shape} vs {w_orig.shape}, using magnitude.")
+                metric = residual.abs()
+        else:
+            # 默认：使用残差的绝对值（幅度筛选）
+            metric = residual.abs()
+        
         k = int(residual.numel() * ortho_ratio)
         # 确保至少选出几个点，防止 k=0
         k = max(k, 1)
         
-        topk_vals, topk_indices = torch.topk(residual.abs().view(-1), k)
+        topk_vals, topk_indices = torch.topk(metric.view(-1), k)
         threshold = topk_vals.min()
         
-        mask = residual.abs() >= threshold
+        mask = metric.view(-1) >= threshold
+        mask = mask.view(residual.shape)
         w_ortho_sparse = residual * mask
         
         # 5. 打包数据 (Packing)
@@ -119,16 +145,43 @@ class OrthoLinear(nn.Module):
 
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
+    
+    def inject_noise(self, noise_std=1.0, target='ortho'):
+        """
+        注入噪声到权重中，用于测试敏感性。
+        
+        Args:
+            noise_std: 噪声的标准差
+            target: 'ortho' 或 'base'，指定注入目标
+        """
+        device = self.ortho_vals.device
+        
+        if target == 'ortho':
+            # 向 Ortho 流注入高斯噪声
+            noise = torch.randn_like(self.ortho_vals) * noise_std
+            self.ortho_vals = (self.ortho_vals + noise.to(torch.float16)).to(device)
+        elif target == 'base':
+            # 向 Base 流注入噪声（需要解包、加噪声、重新打包）
+            # 这是一个简化的实现：我们直接修改 scales 来模拟噪声
+            # 在实际应用中，你可能需要解包 base_packed，加噪声，再打包
+            noise_scale = torch.randn_like(self.scales) * noise_std * 0.1
+            self.scales = (self.scales + noise_scale).clamp(min=1e-6).to(device)
+        else:
+            raise ValueError(f"Unknown target: {target}. Must be 'ortho' or 'base'")
 
-def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
+def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05, fisher_dict=None):
     """
     递归替换模型中的 Linear 层
-    只替换 MLP 的输出层或者 Attention 的输出层通常就足够验证效果了，
-    而且能节省显存。
+    
+    Args:
+        model: 要替换的模型
+        target_modules: 要替换的模块名称列表
+        ratio: Ortho 流的比例
+        fisher_dict: 可选的 Fisher Information 字典，用于曲率加权筛选
     """
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_linear_layers(module, target_modules, ratio)
+            replace_linear_layers(module, target_modules, ratio, fisher_dict)
         
         if isinstance(module, nn.Linear):
             # 检查名字是否匹配 (例如只替换 MLP 的 down projection)
@@ -136,6 +189,23 @@ def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0
             should_replace = any(t in name for t in target_modules)
             if should_replace:
                 print(f"Patching layer: {name}")
-                new_layer = OrthoLinear(module, ortho_ratio=ratio)
+                
+                # 尝试获取对应的 Fisher Information
+                fisher_info = None
+                if fisher_dict is not None:
+                    # 尝试匹配层名称
+                    full_name = None
+                    for key in fisher_dict.keys():
+                        if name in key or key.endswith(name):
+                            full_name = key
+                            break
+                    
+                    if full_name and full_name in fisher_dict:
+                        fisher_info = fisher_dict[full_name]
+                        if fisher_info.shape != module.weight.shape:
+                            print(f"[Warn] Fisher shape mismatch for {name}: {fisher_info.shape} vs {module.weight.shape}")
+                            fisher_info = None
+                
+                new_layer = OrthoLinear(module, ortho_ratio=ratio, fisher_info=fisher_info)
                 setattr(model, name, new_layer)
     return model
