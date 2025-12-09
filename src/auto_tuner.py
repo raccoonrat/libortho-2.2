@@ -10,20 +10,24 @@ class LibOrthoAutoTuner:
         self.ortho_ratio = ortho_ratio
         
         # 搜索空间 (Search Space)
-        # 我们根据之前的实验经验，定义了可能的 Ratio 和 噪声策略
+        # 1. Ratio: 决定 Body 分辨率 (越小越好) 和 骨架强度 (越大越好)
+        #    Ratio 2.0: Body 极好, 骨架弱
+        #    Ratio 6.0: Body 差, 骨架强
         self.ratio_candidates = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0]
         
-        # 噪声模式按"破坏力"排序
+        # 2. Noise Mode: 决定 隐私熵
+        #    uniform_entropy: 最强 (2 bits)
+        #    flicker_binary: 中等 (1 bit)
+        #    stochastic: 弱
         self.noise_candidates = [
-            'deterministic',    # 熵=0
-            'stochastic',       # 熵~0.5 (弱)
-            'flicker_binary',   # 熵=1.0 (中)
-            'uniform_entropy'   # 熵=2.0 (强)
+            'uniform_entropy',
+            'flicker_binary', 
+            'stochastic',
+            'deterministic'
         ]
         
         # 容忍度 (Tolerance)
-        # 我们允许 Base Stream 产生的最大相对 MSE 误差
-        # 这个值越小，Retain PPL 越好，但 Privacy 越难破坏
+        # 允许的 MSE 损失阈值。越小越保守。
         self.mse_threshold = 1e-3 
 
     def run_optimization(self):
@@ -31,40 +35,42 @@ class LibOrthoAutoTuner:
         print(f"Target Modules: {self.target_modules}")
         print(f"Constraints: MSE < {self.mse_threshold}, Maximize Entropy")
         
+        # 启动递归搜索和替换
         self._recursive_tune(self.model)
         
         print(f"[LibOrtho-Auto] Optimization Complete.\n")
 
     def _recursive_tune(self, module):
+        # 遍历所有子模块
         for name, child in module.named_children():
+            # 递归深入
             if len(list(child.children())) > 0:
                 self._recursive_tune(child)
             
+            # 遇到 Linear 层，检查是否是目标
             if isinstance(child, nn.Linear):
-                # 检查是否是目标层
-                # 这里我们假设名字不完全匹配，只要包含即可 (e.g. layers.0.mlp.down_proj)
-                # 为了简化，我们通过父级调用时的逻辑判断，或者在这里再次判断
-                # 假设外部已经做好了筛选，这里只负责替换
-                pass 
+                should_replace = any(t in name for t in self.target_modules)
                 
-        # 由于我们是在 replace_linear_layers 中调用的，我们需要稍微改一下遍历逻辑
-        # 我们直接遍历 model 的模块并替换
-        pass
+                if should_replace:
+                    print(f"[Auto-Tuner] Analyzing layer: {name}...")
+                    
+                    # 1. 寻找最佳配置
+                    best_config = self.find_best_config(child)
+                    
+                    # 2. 执行手术 (原地替换)
+                    new_layer = OrthoLinear(child, config=best_config)
+                    setattr(module, name, new_layer)
+                    
+                    print(f"  -> Applied Config: Ratio={best_config.ratio}, Mode={best_config.noise_mode}")
 
-    # 实际的替换逻辑移回 replace_linear_layers 会更简单
-    # 这里我们提供一个 helper 函数来为一个 Layer 寻找最佳 Config
-    
     def find_best_config(self, layer: nn.Linear) -> OrthoConfig:
         # 1. 准备校准数据 (Calibration Data)
-        # 在没有真实数据的情况下，我们使用符合权重统计分布的高斯噪声
-        # 这是一种"零样本" (Zero-Shot) 校准方法
         w = layer.weight.data
         in_feat = layer.in_features
         device = w.device
         
-        # 模拟输入激活 X
-        # 假设激活服从 N(0, 1)，这对于 LayerNorm 后的输入是合理的假设
-        # 为了更准，可以使用 activation scale (如果有)
+        # 模拟输入激活 X ~ N(0, 1)
+        # 这是零样本校准的关键
         x_calib = torch.randn(128, in_feat, device=device)
         
         # 计算原始输出 (Ground Truth)
@@ -73,89 +79,70 @@ class LibOrthoAutoTuner:
         
         best_config = None
         best_entropy = -1.0
-        best_ratio = 3.0 # Fallback
-        
-        print(f"  > Tuning {layer} ({in_feat}x{layer.out_features})...")
         
         # 2. 网格搜索 (Grid Search)
-        # 我们的目标：找到能满足 MSE 约束的 最大熵配置
-        
-        for noise_mode in reversed(self.noise_candidates): # 优先尝试高熵
+        # 优先搜索高熵模式
+        for noise_mode in self.noise_candidates:
+            # 对于给定的噪声模式，尝试寻找能满足 MSE 的最小 Ratio (为了 Body 精度)
+            # 或者寻找 MSE 最小的 Ratio?
+            # 策略：满足 MSE 门槛的前提下，熵优先。同等熵下，Ratio 越小 Body 分辨率越高(Retain好)。
+            
+            valid_ratios = []
+            
             for ratio in self.ratio_candidates:
-                
-                # 构建临时 Config
                 cfg = OrthoConfig(
                     ratio=ratio, 
                     noise_mode=noise_mode, 
                     ortho_ratio=self.ortho_ratio
                 )
                 
-                # 实例化一个临时的 OrthoLinear (只为了测试 Base Stream)
-                # 注意：我们只关心 Base Stream (Alpha=0) 的表现，因为 Ortho 总是完美的
                 try:
+                    # 实例化临时层测试 Base Stream 性能
                     test_layer = OrthoLinear(layer, config=cfg)
-                    test_layer.set_privacy(enable_ortho=False) # 关闭 Ortho
+                    test_layer.set_privacy(enable_ortho=False) # 关键：测试 Alpha=0
                     
                     with torch.no_grad():
                         y_quant = test_layer(x_calib)
                     
                     # 计算相对 MSE
-                    mse = torch.mean((y_orig - y_quant) ** 2)
+                    diff = y_orig - y_quant
+                    mse = torch.mean(diff ** 2)
                     y_norm = torch.mean(y_orig ** 2)
                     rel_mse = mse / (y_norm + 1e-6)
                     
-                    is_valid = rel_mse < self.mse_threshold
-                    
-                    # 计算虚拟熵分
-                    entropy_score = {
-                        'deterministic': 0,
-                        'stochastic': 1,
-                        'flicker_binary': 2,
-                        'uniform_entropy': 4
-                    }[noise_mode]
-                    
-                    # print(f"    Config(R={ratio}, N={noise_mode}): MSE={rel_mse:.2e} Valid={is_valid}")
-                    
-                    if is_valid:
-                        # 如果满足误差要求
-                        # 并且熵更高，或者熵相同但 Ratio 更小 (Body 精度更高)
-                        if entropy_score > best_entropy:
-                            best_entropy = entropy_score
-                            best_config = cfg
-                        elif entropy_score == best_entropy:
-                            # 同等熵下，选择误差更小的 Ratio (通常越小越好)
-                            # 这里简单的逻辑：如果已经 valid，且熵没变大，就不更新了，除非我们想优化 MSE
-                            # 实际上，对于同一种 Noise Mode，Ratio 越小 MSE 越小。
-                            # 所以我们应该在内循环找到最小可行 Ratio。
-                            if best_config is None or ratio < best_config.ratio:
-                                best_config = cfg
-                                
-                except Exception as e:
+                    if rel_mse < self.mse_threshold:
+                        valid_ratios.append(ratio)
+                        
+                except Exception:
                     continue
+            
+            # 如果当前噪声模式下有合法的 Ratio
+            if valid_ratios:
+                # 选择最小的可行 Ratio (Body 精度最高)
+                # 或者选择最中间的 Ratio (鲁棒性)
+                # 这里我们选择最小可行 Ratio，因为这对 Retain 最有利
+                best_ratio = min(valid_ratios)
+                
+                # 计算熵分
+                entropy_score = {
+                    'uniform_entropy': 4,
+                    'flicker_binary': 2, 
+                    'stochastic': 1,
+                    'deterministic': 0
+                }[noise_mode]
+                
+                # 因为我们是从高熵向低熵遍历，一旦找到满足条件的，就是最优解
+                # 这种贪心策略保证了最大熵
+                best_config = OrthoConfig(
+                    ratio=best_ratio,
+                    noise_mode=noise_mode,
+                    ortho_ratio=self.ortho_ratio
+                )
+                break # 找到最大熵的可行解，停止搜索
 
+        # 兜底策略
         if best_config is None:
-            print("    [WARNING] No valid config found. Fallback to Safe Mode (Ratio=2.5, Deterministic).")
+            print("    [WARNING] No valid config found. Fallback to Safe Mode.")
             best_config = OrthoConfig(ratio=2.5, noise_mode='deterministic', ortho_ratio=self.ortho_ratio)
-        else:
-            print(f"    [LOCKED] Ratio={best_config.ratio}, Mode={best_config.noise_mode}")
             
         return best_config
-
-    def apply(self):
-        # 递归替换
-        self._replace(self.model)
-        
-    def _replace(self, module):
-        for name, child in module.named_children():
-            if len(list(child.children())) > 0:
-                self._replace(child)
-            
-            if isinstance(child, nn.Linear):
-                # 检查名字匹配
-                should_replace = any(t in name for t in self.target_modules)
-                if should_replace:
-                    # 找到最佳配置
-                    best_config = self.find_best_config(child)
-                    # 替换
-                    new_layer = OrthoLinear(child, config=best_config)
-                    setattr(module, name, new_layer)
