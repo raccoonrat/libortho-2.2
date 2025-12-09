@@ -14,17 +14,23 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL TUNING: Optimized Entropy Injection (Ratio=4.0)
+        # PROFESSOR'S CALCULATED VICTORY: Fine-Structure Constant (Ratio=3.25)
         # 
-        # 诊断：
-        # Ratio 5.0 -> Retain 148 (Body starvation).
-        # Ratio 2.5 -> Retain 2292 (Structure collapse).
+        # 物理约束求解：
+        # 1. Body Resolution > 2.0 -> Ratio < 3.5
+        # 2. Skeleton Strength > 2.25x -> (MinInt / 7) * Ratio > 2.25
+        # 3. Entropy > 1.5 bits -> NumStates >= 3 ({5, 6, 7})
         # 
-        # 方案：Ratio = 4.0
-        # 1. Body 映射到 1.75 (Bins 0, 1, 2). 精度提升，Retain 应 < 50.
-        # 2. Outlier Noise {4, 5, 6, 7}.
-        #    - Min (4) 物理强度 = 2.28x BodyMax. 骨架稳固.
-        #    - Entropy 保持 2 bits. Forget 应 > 50.
+        # 求解：
+        # 设使用 {5, 6, 7}。MinInt = 5。
+        # (5 / 7) * Ratio > 2.25  =>  Ratio > 3.15
+        # 
+        # 结合 Ratio < 3.5 和 Ratio > 3.15。
+        # 最优解：Ratio = 3.25。
+        # 
+        # 预期：
+        # - Retain: 安全 (Body Map 2.15, Skeleton 2.32x)。PPL < 30。
+        # - Forget: 成功 (3 States Uniform). PPL > 10。
         
         w_abs = w_orig.abs()
         
@@ -35,26 +41,25 @@ class OrthoLinear(nn.Module):
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 4.0 Scale
+        # 步骤 2: 计算 Ratio 3.25 Scale
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # Ratio 4.0: The Sweet Spot
-        DRC_RATIO = 4.0
+        DRC_RATIO = 3.25
         ceiling = body_max * DRC_RATIO
         
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 最大熵量化
+        # 步骤 3: 三态均匀量化 (Tri-State Uniform)
         
         # 3.1 Body: 确定性量化
         w_int4_det = torch.round(w_scaled)
         
-        # 3.2 Outlier: Uniform Random {4, 5, 6, 7}
-        # 保持之前的逻辑
-        random_mag = torch.randint_like(w_scaled, 4, 8).float()
+        # 3.2 Outlier: Uniform Random {5, 6, 7}
+        # randint(5, 8) -> [5, 6, 7]
+        random_mag = torch.randint_like(w_scaled, 5, 8).float()
         w_int4_entropy = random_mag * w_scaled.sign()
         
         # 3.3 合并
@@ -133,7 +138,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Optimized Entropy Injection (Ratio=4.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Fine-Structure Constant (Ratio=3.25) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
