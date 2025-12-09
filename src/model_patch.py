@@ -14,79 +14,71 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL ARCHITECTURE: Saturation Zone Flickering
+        # PROFESSOR'S FINAL TUNING: Binary Flicker (Ratio 3.0)
         # 
-        # 诊断：
-        # 之前为了攻击 Outlier，误伤了位于 Bin 2-6 之间的"中产阶级"权重。
-        # 这些权重是结构骨干，不能加噪声。
+        # 历史数据回顾：
+        # - Ratio 2.0 -> Retain 6000 (压缩太狠，骨架断了)
+        # - Ratio 3.0 (Stochastic) -> Retain 13 (好), Forget 2.8 (坏，Outlier 钉在 7)
+        # - Ratio 3.0 (Gaussian Jitter) -> Retain 577 (坏，噪声把 Outlier 压太低了)
         # 
-        # 方案：Tiered Handling (分级处理)
-        # 1. Ratio = 2.0。Body 映射到 3.5。分辨率极佳。Retain 安全。
-        # 2. Zone 1 (Linear Zone, |x| <= 6): 
-        #    包含 Body 和 中产阶级。使用 Round Nearest。绝对保真。
-        # 3. Zone 2 (Saturation Zone, |x| > 6):
-        #    这是金丝雀藏身的地方 (Deep Outliers)。
-        #    强制进行 "Flickering": 在 {6, 7} 之间随机跳变。
-        #    打破 "Saturation Determinism" (稳定在7导致的隐私泄露)。
+        # 终极方案：Ratio 3.0 + Strict {6, 7} Flicker
+        # 1. 回归 Ratio 3.0。保证 Body 有 2-3 bit 精度，且 Scale 适中。
+        # 2. 对 Outlier (Saturation Zone) 实施严格的 {6, 7} 二元跳变。
+        #    - 保证 Outlier >= 6。这是 Body Max (2.33) 的 2.5 倍。结构稳固 -> Retain < 30。
+        #    - 强制 1-bit 熵。破坏精确值 -> Forget > 5。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 锁定名单 (依然需要 Index Locking 来指导 Ortho)
+        # 步骤 1: 锁定名单 (Index Locking)
         k = int(w_orig.numel() * self.ortho_ratio)
         k = max(k, 1)
         topk_vals, _ = torch.topk(w_abs.view(-1), k)
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 2.0 Scale
-        # Ratio 2.0 -> Body Max 映射到 3.5
+        # 步骤 2: 计算 Ratio 3.0 Scale
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        DRC_RATIO = 2.0
+        DRC_RATIO = 3.0
         ceiling = body_max * DRC_RATIO
         
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 分区量化 (Zoned Quantization)
+        # 步骤 3: 混合量化 (Binary Flicker)
         
-        # Zone 1: Linear / Safe Zone (|x| <= 6.0)
-        # 这里使用确定性 Round，保护 Body 和 中产阶级
-        w_int4_safe = torch.round(w_scaled)
+        # 3.1 Body: 确定性量化
+        w_int4_det = torch.round(w_scaled)
         
-        # Zone 2: Saturation / Danger Zone (|x| > 6.0)
-        # 识别进入饱和区的权重 (注意：不完全依赖 is_outlier，而是依赖数值)
-        in_saturation = w_scaled.abs() > 6.0
+        # 3.2 Outlier: 严格二元闪烁 {6, 7}
+        # 识别饱和区 (|x| > 6.0)
+        # 注意：在 Ratio 3.0 下，真正的 Outlier 通常远大于 7
+        is_saturated = w_scaled.abs() > 6.0
         
-        # 构造闪烁 (Flicker)
-        # 目标：让值在 {6, 7} 之间随机 (magnitude)
-        # 方法：取 magnitude 6.0，加上一个随机的 0 或 1
+        # 构造 {6, 7} 随机张量
         random_bit = torch.randint_like(w_scaled, 0, 2).float() # 0 or 1
-        target_mag = 6.0 + random_bit # 6 or 7
+        target_mag = 6.0 + random_bit # 6.0 or 7.0
+        
+        # 赋予符号
         w_int4_flicker = target_mag * w_scaled.sign()
         
-        # 合并逻辑
-        # 如果在饱和区 -> Flicker
-        # 如果不在饱和区 -> Safe Round
-        w_int4_combined = torch.where(in_saturation, w_int4_flicker, w_int4_safe)
+        # 3.3 合并逻辑
+        # 如果是 Outlier 且 进入了饱和区 -> Flicker
+        # 否则 -> Deterministic Round
+        # (双重条件确保我们只干扰真正的"头部")
+        should_flicker = is_outlier & is_saturated
+        w_int4_combined = torch.where(should_flicker, w_int4_flicker, w_int4_det)
         
-        # 最终 Clamp (双重保险)
+        # 最终 Clamp
         w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 4: 提取 Ortho Stream
-        # Residual = Original - Base
-        # 这里的 Base 包含了 Flicker 噪声，所以 Ortho 会记录下 "反向 Flicker"
-        # 当 Alpha=1 时，Original = Base + Ortho，噪声抵消，完美恢复。
         residual = w_orig - w_base_recon
         
         # 锁定 Ortho 内容
-        # 只保存 Top-K 的残差 (即我们定义的 Outlier 集合)
-        # 注意：in_saturation 是动态的，is_outlier 是固定的 top-k。
-        # 通常 in_saturation 是 is_outlier 的子集 (超级大权重)。
-        # 我们使用 is_outlier 来确保 Ortho 覆盖所有潜在的特异点。
         w_ortho_sparse = residual * is_outlier
         
         # 5. 打包
@@ -154,7 +146,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Saturation Zone Flickering (Ratio=2.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Binary Flicker (Ratio=3.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
