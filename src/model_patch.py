@@ -14,22 +14,28 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL TUNING: Binary Flicker (Ratio 3.0)
+        # PROFESSOR'S FINAL CUT: Stochastic Binary Erasure
         # 
-        # 历史数据回顾：
-        # - Ratio 2.0 -> Retain 6000 (压缩太狠，骨架断了)
-        # - Ratio 3.0 (Stochastic) -> Retain 13 (好), Forget 2.8 (坏，Outlier 钉在 7)
-        # - Ratio 3.0 (Gaussian Jitter) -> Retain 577 (坏，噪声把 Outlier 压太低了)
+        # 理论突破：
+        # - 之前的 $\{6, 7\}$ 闪烁失败，说明金丝雀记忆依赖于"高值"的存在性，而非精确值。
+        # - 只要权重是"高"的 (High Signal)，记忆电路就是通的。
         # 
-        # 终极方案：Ratio 3.0 + Strict {6, 7} Flicker
-        # 1. 回归 Ratio 3.0。保证 Body 有 2-3 bit 精度，且 Scale 适中。
-        # 2. 对 Outlier (Saturation Zone) 实施严格的 {6, 7} 二元跳变。
-        #    - 保证 Outlier >= 6。这是 Body Max (2.33) 的 2.5 倍。结构稳固 -> Retain < 30。
-        #    - 强制 1-bit 熵。破坏精确值 -> Forget > 5。
+        # 方案：Signal Dropout / Erasure
+        # 我们必须随机"切断"一部分 Outlier，让它们跌落凡尘 (变成 Body 水平)。
+        # 
+        # 设定：
+        # - Ratio = 3.0 (保持 Body 精度)。
+        # - Outlier 状态：
+        #   - State A (50%): 保持 High Value (7)。维持骨架。
+        #   - State B (50%): 坍缩至 Low Value (2)。切断回路。
+        # 
+        # 预期：
+        # - Retain: 鲁棒的通用知识可以通过剩余的 50% 骨架和完整的 Body 存活。
+        # - Forget: 脆弱的金丝雀回路被随机打断，无法激活。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 锁定名单 (Index Locking)
+        # 步骤 1: 锁定名单
         k = int(w_orig.numel() * self.ortho_ratio)
         k = max(k, 1)
         topk_vals, _ = torch.topk(w_abs.view(-1), k)
@@ -47,38 +53,42 @@ class OrthoLinear(nn.Module):
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 混合量化 (Binary Flicker)
+        # 步骤 3: 二元擦除量化 (Binary Erasure)
         
         # 3.1 Body: 确定性量化
         w_int4_det = torch.round(w_scaled)
         
-        # 3.2 Outlier: 严格二元闪烁 {6, 7}
-        # 识别饱和区 (|x| > 6.0)
-        # 注意：在 Ratio 3.0 下，真正的 Outlier 通常远大于 7
-        is_saturated = w_scaled.abs() > 6.0
+        # 3.2 Outlier: 构造擦除态
+        # High State: 7 (保持 Outlier 特征)
+        # Low State: 2 (模拟 Body Max，即"隐身")
+        # 为什么是 2? 因为 Ratio=3.0 下，Body Max 映射到 2.33。
+        # 变成 2 意味着 Outlier 伪装成了普通的 Body 权重。
         
-        # 构造 {6, 7} 随机张量
-        random_bit = torch.randint_like(w_scaled, 0, 2).float() # 0 or 1
-        target_mag = 6.0 + random_bit # 6.0 or 7.0
+        # 生成掩码：50% 概率保持 High，50% 概率 Drop 到 Low
+        mask_keep = torch.rand_like(w_scaled) > 0.5
+        
+        target_mag = torch.where(mask_keep, torch.tensor(7.0, device=device), torch.tensor(2.0, device=device))
         
         # 赋予符号
-        w_int4_flicker = target_mag * w_scaled.sign()
+        w_int4_erasure = target_mag * w_scaled.sign()
         
-        # 3.3 合并逻辑
-        # 如果是 Outlier 且 进入了饱和区 -> Flicker
-        # 否则 -> Deterministic Round
-        # (双重条件确保我们只干扰真正的"头部")
-        should_flicker = is_outlier & is_saturated
-        w_int4_combined = torch.where(should_flicker, w_int4_flicker, w_int4_det)
+        # 3.3 合并
+        # 只有在饱和区 (|x| > 2.5) 的 Outlier 才应用擦除
+        # 这样避免误伤本来就不大的 Outlier
+        is_saturated = w_scaled.abs() > 2.5
+        should_erase = is_outlier & is_saturated
+        
+        w_int4_combined = torch.where(should_erase, w_int4_erasure, w_int4_det)
         
         # 最终 Clamp
         w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 4: 提取 Ortho Stream
+        # Residual = Original - ErasureBase
+        # Ortho 记录了所有被擦除的信息 (7->2 的巨大落差)，Alpha=1 时完美补回。
         residual = w_orig - w_base_recon
         
-        # 锁定 Ortho 内容
         w_ortho_sparse = residual * is_outlier
         
         # 5. 打包
@@ -146,7 +156,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Binary Flicker (Ratio=3.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Stochastic Binary Erasure (Ratio=3.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
