@@ -14,79 +14,77 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S HYBRID ARCHITECTURE: Six Sigma
-        # 
-        # 实验数据回顾：
-        # Ratio=3.0 (Global Stochastic) -> Retain 157 (Brain Fog) / Forget 75 (Success).
+        # PROFESSOR'S FINAL CORRECTION: Index-Locked Separation
         # 
         # 诊断：
-        # 全局随机噪声误伤了 Body (通用知识)。Body 需要精确，不能抖动。
-        # Ratio 3.0 略显激进，限制了 Outlier 的表达。
+        # 上一次实验中 Alpha=1 和 Alpha=0 效果一样 (PPL ~42)。
+        # 这说明 Ortho Stream 没有包含关键的金丝雀信息。
+        # 原因：Body 的量化误差 (因 Scale 变大而变大) 挤占了 Top-K Residual 的名额。
+        # 金丝雀 (Outlier) 被随机化破坏后，没能进入 Ortho，导致无法恢复。
         # 
-        # 方案：Ratio=6.0 + Hybrid Rounding
-        # 1. 放宽 Ratio 到 6.0 (让结构更舒展)。
-        # 2. 混合量化：
-        #    - Body (< Threshold): Round Nearest (保精度)。
-        #    - Outlier (> Threshold): Stochastic Rounding (破隐私)。
+        # 方案：Index-Locking
+        # 我们不再让 Residual 竞争上岗。
+        # 我们基于原始幅度 (Magnitude) 圈定 Outlier Mask。
+        # 1. Base Stream: 对 Mask 内元素应用随机量化，对 Mask 外应用确定性量化。
+        # 2. Ortho Stream: *强制* 只存储 Mask 内元素的残差。
+        #    忽略 Mask 外的所有误差 (Body 误差)。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 确定 Body 的幅度
-        target_quantile = 1.0 - self.ortho_ratio
-        k_idx = int(self.in_features * target_quantile)
-        k_idx = max(1, min(k_idx, self.in_features - 1))
+        # 步骤 1: 锁定名单 (Index Locking)
+        # 严格按照 budget 圈定 Top-K
+        k = int(w_orig.numel() * self.ortho_ratio)
+        k = max(k, 1)
         
-        body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
+        # 全局 Top-K (或者逐行，这里用全局更简单直接，保证 budget 利用率)
+        topk_vals, _ = torch.topk(w_abs.view(-1), k)
+        threshold = topk_vals.min()
+        
+        # 这就是我们的"特权名单"
+        is_outlier = w_abs >= threshold
+        
+        # 步骤 2: 计算六西格玛 Scale
+        # 为了给 Body 留足空间，我们依然使用 Body Max * 6.0
+        # Body 是非 Outlier 的部分
+        w_body = w_orig * (~is_outlier)
+        body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # 步骤 2: 六西格玛压缩 (Ratio = 6.0)
-        # Outlier 允许达到 Body 的 6 倍。
         DRC_RATIO = 6.0
         ceiling = body_max * DRC_RATIO
         
-        # 步骤 3: 混合量化 (Hybrid Quantization)
-        
-        # 3.1 准备 Scale
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 3.2 分离 Body 和 Outlier 区域
-        # 注意：这里的 Outlier 定义是基于压缩前的原始值是否"显著大"
-        # 或者简单地：幅度超过 Body Max 的部分应用随机性
-        # 我们使用 body_max / scales 作为分界线 (约为 7/6 = 1.16)
-        # 也就是说，Bin 0-1 (Body) 保持精确，Bin 2-7 (Outlier tail) 加入噪声
+        # 步骤 3: 混合量化 (基于名单)
         
-        threshold_bin = body_max / self.scales
-        is_outlier = w_scaled.abs() > threshold_bin
-        
-        # 3.3 Body: Deterministic Rounding
+        # 3.1 Body: Deterministic
         w_int4_det = torch.round(w_scaled)
         
-        # 3.4 Outlier: Stochastic Rounding
+        # 3.2 Outlier: Stochastic
         w_floor = w_scaled.floor()
         prob = w_scaled - w_floor
         noise = torch.rand_like(prob)
         w_int4_stoch = w_floor + (noise < prob).float()
         
-        # 3.5 合并
-        # 在 Outlier 区域使用随机值，其他区域使用确定值
+        # 3.3 合并 (Index Locked!)
+        # 只有名单上的人才会被随机化
         w_int4_combined = torch.where(is_outlier, w_int4_stoch, w_int4_det)
         
-        # Clamp 最终结果
+        # Clamp
         w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
-        # 步骤 4: 提取 Ortho Stream
+        # 步骤 4: 提取 Ortho Stream (定向救援)
         residual = w_orig - w_base_recon
         
-        # 几何筛选
-        k = int(residual.numel() * ortho_ratio)
-        k = max(k, 1)
-        topk_vals, _ = torch.topk(residual.abs().view(-1), k)
-        threshold = topk_vals.min()
+        # 关键修改：不再重新计算 Top-K Residual！
+        # 直接使用 is_outlier Mask。
+        # 我们只保存 Outlier 的残差。Body 的残差丢弃（视为噪音）。
         
-        mask = residual.abs() >= threshold
-        w_ortho_sparse = residual * mask
+        # 由于我们最初就是按 ratio 计算的 k，所以 mask 的大小正好符合 Ortho 的容量。
+        # 不会浪费，也不会溢出。
+        w_ortho_sparse = residual * is_outlier
         
         # 5. 打包
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
@@ -153,7 +151,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Six Sigma Hybrid Architecture (Ratio=6.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Index-Locked Hybrid Architecture (Ratio=6.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
