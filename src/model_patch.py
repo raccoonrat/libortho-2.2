@@ -17,17 +17,37 @@ class OrthoLinear(nn.Module):
         device = w_orig.device
         
         # 2. 模拟 INT4 量化 (Base Stream)
-        # 这是一个简单的 MinMax 量化实现，用于生成 Base
-        self.scales = (w_orig.abs().max(dim=1, keepdim=True)[0] / 7.0).to(torch.float32)
+        # LINUS FIX: 使用鲁棒缩放 (Robust Scaling)
+        # 不要让异常值 (Outliers) 决定 Scale。如果用 max()，异常值会被完美量化进 Base。
+        # 我们取 99.5% 分位数作为 Scale 的基准，强迫异常值溢出产生巨大残差。
+        
+        # 计算每行的绝对值
+        w_abs = w_orig.abs()
+        
+        # 使用 kthvalue 近似 quantile(0.995)，比全排序快
+        # 每一行有 in_features 个元素，取第 k 大的作为阈值
+        k_idx = int(self.in_features * 0.995)
+        k_idx = min(k_idx, self.in_features - 1)
+        robust_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
+        
+        # 防止全 0 行导致的除零
+        robust_max.clamp_(min=1e-6)
+        
+        self.scales = (robust_max / 7.0).to(torch.float32)
+        
+        # 量化并截断。异常值在这里会被 clamp 到 +/- 7，产生巨大误差
         w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 3. 计算残差 (Residual)
+        # 现在异常值的残差会非常大： Original(1.5) - Base(0.01) = 1.49
         residual = w_orig - w_base_recon
         
-        # 4. 提取正交流 (Ortho Stream) - 只有最大的 5% 残差被保留
-        # 这就是你的“高曲率/异常值”假设的近似
+        # 4. 提取正交流 (Ortho Stream) - 只有最大的 % 残差被保留
         k = int(residual.numel() * ortho_ratio)
+        # 确保至少选出几个点，防止 k=0
+        k = max(k, 1)
+        
         topk_vals, topk_indices = torch.topk(residual.abs().view(-1), k)
         threshold = topk_vals.min()
         
@@ -72,7 +92,8 @@ class OrthoLinear(nn.Module):
                 f"Please move the input to CUDA: x = x.to('cuda')"
             )
         
-        x_flat = x.view(-1, self.in_features)
+        # Handle cases where input might not be contiguous or has weird strides
+        x_flat = x.view(-1, self.in_features).contiguous()
         
         # C++ 算子期望 float32 输入，所以需要转换
         x_flat_f32 = x_flat.to(torch.float32)
