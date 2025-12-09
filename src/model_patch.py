@@ -14,66 +14,70 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL FIX: Ceiling Jitter
+        # PROFESSOR'S SOLUTION: Variable Ceiling Saturation (VCS)
         # 
         # 诊断：
-        # Forget PPL 2.8 失败的原因是 "Saturation Silence"。
-        # 巨大的 Outlier 被 Clamp 到 7.0 后，其小数部分为 0。
-        # Stochastic Rounding 对整数无效 (prob=0)。
-        # 结果：Outlier 被确定性地编码为 7，没有任何噪声。隐私借此存活。
+        # - Jitter 1.5 (Gaussian) 太不可控，导致 Outlier 平均幅度下降过多，骨架断裂。
+        # - Stochastic (Bernoulli) 太微弱，无法撼动金丝雀。
         # 
-        # 方案：Grid-Space Noise Injection
-        # 我们必须在量化 *前*，在网格空间 (Grid Space) 对 Outlier 注入强噪声。
-        # 强迫它从天花板 (7.0) 掉下来，在 {5, 6, 7} 之间随机跳动。
+        # 方案：Bounded Discrete Noise (VCS)
+        # 我们让 Outliers 的饱和天花板在 {5, 6, 7} 之间随机浮动。
+        # 
+        # 优势：
+        # 1. 有界性 (Bounded): 最小值是 5。保证了 Outlier 依然显著大于 Body (Ratio 3.5 下 Body Max ~2)。
+        #    -> Retain PPL 安全。
+        # 2. 强干扰 (High Variance): {5, 6, 7} 的跳变比 +/- 0.5 的随机量化强得多。
+        #    -> Forget PPL 上升。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 锁定名单
+        # 步骤 1: 锁定名单 (Index Locking)
         k = int(w_orig.numel() * self.ortho_ratio)
         k = max(k, 1)
+        
         topk_vals, _ = torch.topk(w_abs.view(-1), k)
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 3.0 Scale (Retain 友好的)
+        # 步骤 2: 计算 Ratio 3.5 Scale
+        # 微调 Ratio 到 3.5，给 Body 稍多一点空间，同时保持 Outlier 的显著性
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        DRC_RATIO = 3.0
+        DRC_RATIO = 3.5
         ceiling = body_max * DRC_RATIO
         
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 混合量化 + 主动抖动
+        # 步骤 3: 混合量化 + 可变天花板
         
         # 3.1 Body: 确定性量化
         w_int4_det = torch.round(w_scaled)
         
-        # 3.2 Outlier: 注入 Grid 噪声！
-        # 先 Clamp 到 [-7, 7] 范围，这时候 Outlier 都在边界上
-        w_outlier_grid = w_scaled.clamp(-7, 7)
+        # 3.2 Outlier: Variable Ceiling
+        # 生成随机天花板张量，取值范围 {5, 6, 7}
+        # random_(5, 8) 生成 [5, 6, 7] 的整数
+        random_ceil = torch.empty_like(w_scaled).random_(5, 8)
         
-        # 关键一步：注入噪声
-        # sigma=1.0 意味着它有很大几率偏离 7.0 达到 6.0 或 5.0
-        jitter = torch.randn_like(w_outlier_grid) * 1.5
-        w_outlier_jittered = w_outlier_grid + jitter
+        # 对于正数，clamp(0, ceil)
+        # 对于负数，clamp(-ceil, 0)
+        # 简单写法：abs().clamp(0, ceil) * sign
+        w_outlier_vcs = w_scaled.abs().clamp(max=random_ceil) * w_scaled.sign()
         
-        # 然后再 Round。
-        # 注意：这里不需要再 Stochastic Round 了，因为 Jitter 本身就是随机源
-        w_int4_jittered = torch.round(w_outlier_jittered)
+        # 确保它是整数 (虽然 random_ceil 是整数，但 w_scaled 不是，clamp 后可能带小数)
+        # 这里我们直接 Round，因为我们希望它是 {5, 6, 7}
+        w_int4_vcs = torch.round(w_outlier_vcs)
         
         # 3.3 合并
-        w_int4_combined = torch.where(is_outlier, w_int4_jittered, w_int4_det)
+        w_int4_combined = torch.where(is_outlier, w_int4_vcs, w_int4_det)
         
-        # 最终 Clamp 确保合法 INT4
+        # 最终 Clamp (双重保险)
         w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 4: 提取 Ortho Stream
-        # Residual = Original - JitteredBase
-        # Ortho 会捕捉到所有的 Jitter 误差，所以在 Alpha=1 时能完美复原。
         residual = w_orig - w_base_recon
         
         # 锁定 Ortho
@@ -144,7 +148,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Ceiling Jitter (Ratio=3.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Variable Ceiling Saturation (Ratio=3.5) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
