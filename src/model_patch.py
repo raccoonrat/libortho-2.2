@@ -1,97 +1,106 @@
 import torch
 import torch.nn as nn
 import math
-import libortho_ops  # 我们的 C++ 扩展
+import libortho_ops
+from dataclasses import dataclass
+from typing import Optional, Literal
+
+# 定义配置数据结构
+@dataclass
+class OrthoConfig:
+    ratio: float = 3.0
+    # 策略模式: 
+    # 'deterministic': 纯确定性 (保结构)
+    # 'stochastic': 简单随机 (弱隐私)
+    # 'flicker_binary': {6, 7} 二元闪烁
+    # 'uniform_entropy': {4, 5, 6, 7} 均匀分布 (强隐私)
+    noise_mode: Literal['deterministic', 'stochastic', 'flicker_binary', 'uniform_entropy'] = 'deterministic'
+    ortho_ratio: float = 0.05
 
 class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.05):
+    def __init__(self, original_layer, config: Optional[OrthoConfig] = None):
         super().__init__()
         self.in_features = original_layer.in_features
         self.out_features = original_layer.out_features
-        self.ortho_ratio = ortho_ratio
         
-        # 1. 获取原始权重
+        # 默认配置
+        if config is None:
+            config = OrthoConfig()
+        self.config = config
+        
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S PRECISION STRIKE: Deep Outlier Erasure (Ratio=3.0)
-        # 
-        # 诊断：
-        # - 之前的 Erasure 失败是因为攻击了所有 > 2.5 的权重 (Middle Class + Outliers)。
-        # - Middle Class (Bins 3-6) 是结构骨干，不能动。
-        # - Canary 藏在 Deep Outliers (> 6.5) 里。
-        # 
-        # 方案：
-        # 1. Ratio = 3.0。Body 映射到 2.33。
-        # 2. 识别 Deep Outliers (|x| > 6.5)。
-        # 3. 对 Deep Outliers 实施 {3, 7} 强力擦除。
-        #    - 跌落幅度 7->3 (跨越 4 个 Bin)，信息破坏力极大。
-        #    - 仅影响极少数权重，Retain 安全。
-        # 4. 对 Middle Class (|x| <= 6.5) 实施确定性量化，保护骨架。
+        # --- 核心逻辑：基于配置构建流形 ---
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 锁定名单 (用于 Ortho 存储)
-        k = int(w_orig.numel() * self.ortho_ratio)
+        # 1. 锁定名单 (Index Locking)
+        k = int(w_orig.numel() * self.config.ortho_ratio)
         k = max(k, 1)
         topk_vals, _ = torch.topk(w_abs.view(-1), k)
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 3.0 Scale
+        # 2. 计算 Scale (由 Ratio 决定)
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        DRC_RATIO = 3.0
-        ceiling = body_max * DRC_RATIO
-        
+        ceiling = body_max * self.config.ratio
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 靶向擦除量化
+        # 3. 执行量化策略 (由 Noise Mode 决定)
+        w_int4_det = torch.round(w_scaled) # 基础确定性版本
         
-        # 3.1 基础：确定性量化 (保护 Body 和 Middle Class)
-        w_int4_det = torch.round(w_scaled)
-        
-        # 3.2 识别 Deep Outliers (Kill Zone)
-        # 只有真正触顶的权重才会被攻击
-        is_deep = w_scaled.abs() > 6.5
-        
-        # 3.3 构造擦除态 {3, 7}
-        # 50% 概率保持 7 (High)
-        # 50% 概率跌落 3 (Low - 也就是 Middle Class 的底线)
-        mask_keep = torch.rand_like(w_scaled) > 0.5
-        target_mag = torch.where(mask_keep, torch.tensor(7.0, device=device), torch.tensor(3.0, device=device))
-        
-        w_int4_erasure = target_mag * w_scaled.sign()
-        
-        # 3.4 合并
-        # 只有 is_deep 才应用 Erasure
-        # 这意味着 [2.33, 6.5] 之间的 Middle Class 保持原样 (3, 4, 5, 6)
-        w_int4_combined = torch.where(is_deep, w_int4_erasure, w_int4_det)
-        
-        # 最终 Clamp
-        w_int4_sim = w_int4_combined.clamp(-7, 7)
+        if self.config.noise_mode == 'deterministic':
+            # 纯结构保留
+            w_int4_final = w_int4_det
+            
+        elif self.config.noise_mode == 'stochastic':
+            # 基础随机量化
+            w_floor = w_scaled.floor()
+            prob = w_scaled - w_floor
+            noise = torch.rand_like(prob)
+            w_int4_stoch = w_floor + (noise < prob).float()
+            w_int4_final = torch.where(is_outlier, w_int4_stoch, w_int4_det)
+            
+        elif self.config.noise_mode == 'flicker_binary':
+            # {6, 7} 闪烁
+            # 仅在饱和区生效
+            is_saturated = w_scaled.abs() > 6.0
+            random_bit = torch.randint_like(w_scaled, 0, 2).float()
+            target_mag = 6.0 + random_bit
+            w_int4_flicker = target_mag * w_scaled.sign()
+            
+            should_flicker = is_outlier & is_saturated
+            w_int4_final = torch.where(should_flicker, w_int4_flicker, w_int4_det)
+            
+        elif self.config.noise_mode == 'uniform_entropy':
+            # {4, 5, 6, 7} 最大熵均匀分布
+            # 这是我们发现的最强攻击
+            random_mag = torch.randint_like(w_scaled, 4, 8).float()
+            w_int4_entropy = random_mag * w_scaled.sign()
+            
+            w_int4_final = torch.where(is_outlier, w_int4_entropy, w_int4_det)
+            
+        else:
+            raise ValueError(f"Unknown noise mode: {self.config.noise_mode}")
+
+        # 4. 最终组装
+        w_int4_sim = w_int4_final.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
-        # 步骤 4: 提取 Ortho Stream
-        # Residual = Original - ErasureBase
-        # Ortho 记录了 Deep Outlier 的剧烈波动
         residual = w_orig - w_base_recon
-        
-        # 锁定 Ortho 内容
-        # 依然使用宽泛的 is_outlier 名单 (Top 5%)
-        # 这样既包含了被攻击的 Deep Outlier，也包含了可能有量化误差的 Middle Class
         w_ortho_sparse = residual * is_outlier
         
-        # 5. 打包
+        # Packing
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
         self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
         
-        # Ortho CSR
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
         self.ortho_vals = w_ortho_csr.values().to(torch.float16)
         self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
@@ -100,7 +109,7 @@ class OrthoLinear(nn.Module):
         self.nnz = self.ortho_vals.numel()
         self.alpha = 1.0
         
-        # Move to device
+        # Device transfer
         self.base_packed = self.base_packed.to(device)
         self.scales = self.scales.to(device)
         self.ortho_vals = self.ortho_vals.to(device)
@@ -138,19 +147,14 @@ class OrthoLinear(nn.Module):
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
 
-def _replace_recursive(model, target_modules, ratio):
-    for name, module in model.named_children():
-        if len(list(module.children())) > 0:
-            _replace_recursive(module, target_modules, ratio)
-        
-        if isinstance(module, nn.Linear):
-            should_replace = any(t in name for t in target_modules)
-            if should_replace:
-                new_layer = OrthoLinear(module, ortho_ratio=ratio)
-                setattr(model, name, new_layer)
-
+# 占位符函数，稍后由 AutoTuner 调用
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Deep Outlier Erasure (Ratio=3.0, Target>6.5) to {target_modules}...")
-    _replace_recursive(model, target_modules, ratio)
-    print(f"[LibOrtho-Professor] Surgery complete.")
+    # 这里我们引入一个新的逻辑：如果检测到 AutoTuner，则使用 AutoTuner
+    # 否则使用默认的安全配置
+    from auto_tuner import LibOrthoAutoTuner
+    print(f"[LibOrtho] Initializing Auto-Tuner System...")
+    
+    tuner = LibOrthoAutoTuner(model, target_modules, ortho_ratio=ratio)
+    tuner.run_optimization()
+    
     return model
