@@ -14,55 +14,71 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # LINUS FIX: 主动分离 (Active Separation)
-        # 之前的逻辑是 "Quantize -> Residual -> Ortho"，这导致 Max Scaling 把异常值留在了 Base。
-        # 现在的逻辑是 "Identify Outliers -> Move to Ortho -> Quantize Body"。
-        # 这样 Outliers (Privacy) 被强制隔离，且 Base Stream 的 Scale 更细腻。
+        # LINUS FIX: 饱和式分离 (Saturated Separation)
+        # 错误回顾：
+        # - Max Scaling: Base 包容了 Outlier -> 隐私泄露。
+        # - Zero Filling: Base 变成了 0 -> 脑叶切除，PPL 爆炸。
+        # 
+        # 正确方案：Budget-Aware Saturation
+        # 1. 根据 ortho_ratio 计算精确的 Scale 阈值。
+        # 2. 直接量化 w_orig。超过阈值的 Outlier 会自然被 Clamp 到 +/- 7。
+        #    这意味着 Base Stream 存储的是“饱和值”（Saturated Value）。
+        # 3. 计算 Residual = Original - Saturated。
+        # 4. Ortho Stream 存储这些 Residual。
+        # 
+        # 结果：
+        # Alpha=1: Original = Saturated + Residual (完美重建)
+        # Alpha=0: Base = Saturated (虽有削顶，但保留了符号和最大幅度，房子不会塌)
         
         w_abs = w_orig.abs()
         
-        # 2. 识别 Outliers (前 ortho_ratio 大的权重)
-        k = int(self.in_features * self.ortho_ratio)
-        k = max(k, 1) # 至少选一个，防止空指针
+        # 2. 计算精确的 Scale 边界
+        # 我们有 ratio 的预算，所以我们把 Scale 设在 (1 - ratio) 的分位数上。
+        # 这样，正好有 ratio 比例的权重会发生“饱和”（Clipping）。
+        # 而我们的 Ortho Stream 正好有容量去修复这些饱和误差。
+        target_quantile = 1.0 - self.ortho_ratio
+        k_idx = int(self.in_features * target_quantile)
+        k_idx = max(1, min(k_idx, self.in_features - 1))
         
-        # 找到每一行的阈值
-        # dim=1 (In_Features)
-        topk_vals, _ = torch.topk(w_abs, k, dim=1)
-        # 取第 k 大的值作为阈值
-        thresholds = topk_vals[:, -1].unsqueeze(1)
+        # 每一行的阈值
+        thresholds = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
+        thresholds.clamp_(min=1e-6)
         
-        # 生成掩码：谁是 Outlier？
-        # 注意：这里我们严格把大于等于阈值的都归为 Ortho
-        ortho_mask = w_abs >= thresholds
-        
-        # 3. 构建 Ortho Stream (FP16)
-        # 只有 Outliers 进入这里
-        w_ortho_sparse = w_orig * ortho_mask
+        # 3. 设置 Scales
+        # 阈值对应 INT4 的最大值 7
+        self.scales = (thresholds / 7.0).to(torch.float32)
         
         # 4. 构建 Base Stream (INT4)
-        # 剩下的 Body 部分
-        w_body = w_orig * (~ortho_mask)
+        # 关键点：我们不对 w_orig 做掩码！
+        # 我们让大权重自然地被 Clamp 到 -7 或 7。
+        # 这就是“饱和”。
+        w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
+        w_base_recon = w_int4_sim * self.scales
         
-        # 重新计算 Scale！
-        # 这次 Scale 是基于 Body 的 Max，而不是全局 Max。
-        # 因为 Body 移除了 Outliers，Robust Max 会显著变小，分辨率提高。
-        body_abs = w_body.abs()
-        robust_max = body_abs.max(dim=1, keepdim=True)[0]
-        robust_max.clamp_(min=1e-6)
+        # 5. 构建 Ortho Stream
+        # Residual = 原始值 - 饱和值
+        # 对于 Body 部分，Residual 是量化噪声（小）。
+        # 对于 Outlier 部分，Residual 是削顶损失（大）。
+        residual = w_orig - w_base_recon
         
-        self.scales = (robust_max / 7.0).to(torch.float32)
+        # 我们只保存最大的那些 Residual，数量严格等于我们的预算
+        # 由于我们的 Scale 是按 quantile 算的，理论上大 Residual 的数量应该正好接近预算
+        k = int(residual.numel() * ortho_ratio)
+        k = max(k, 1)
         
-        # 量化 Body
-        # 注意：原先 Outlier 的位置现在是 0，0 量化后还是 0。完美。
-        w_int4_sim = torch.round(w_body / self.scales).clamp(-7, 7)
+        topk_vals, topk_indices = torch.topk(residual.abs().view(-1), k)
+        min_residual_val = topk_vals.min()
         
-        # 5. 打包 Base Stream
+        mask = residual.abs() >= min_residual_val
+        w_ortho_sparse = residual * mask
+        
+        # 6. 打包 Base Stream
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
         self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
         
-        # 6. 打包 Ortho Stream (CSR)
+        # 7. 打包 Ortho Stream (CSR)
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
         self.ortho_vals = w_ortho_csr.values().to(torch.float16)
         self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
