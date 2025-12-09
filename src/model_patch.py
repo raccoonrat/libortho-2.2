@@ -14,62 +14,76 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL CORRECTION: Damped Projection
+        # PROFESSOR'S DIAGNOSIS: Dynamic Range Collapse
         # 
-        # 理论修正：
-        # - Structure 需要 High Magnitude (不能置零/饱和)。
-        # - Privacy 也藏在 High Magnitude 中。
+        # 问题：Even with damping 0.2, the outliers are still too large relative to the body.
+        #       Scale is set by outliers -> Body falls below 0.5 -> Quantizes to 0.
+        #       Result: PPL 783 (Body is dead).
         # 
-        # 解决方案：去极化 (Depolarization) / 阻尼 (Damping)。
-        # 我们将 Base Stream 中的 Outliers 缩放一个因子 lambda (e.g. 0.2)。
-        # Outlier: 100.0 -> Base: 20.0
+        # 物理定律：INT4 Linear Quantization has a max dynamic range of ~14x.
+        #          (Max 7 / Min 0.5 = 14)
         # 
-        # 预期效应：
-        # 1. Structure: 20.0 远大于 Body (1.0)，骨架保留 -> Retain PPL 安全。
-        # 2. Privacy: 20.0 低于金丝雀的激活阈值 -> Forget PPL 上升。
+        # 解决方案：Adaptive Dynamic Range Compression (DRC).
+        # 我们强制将 Base Stream 的动态范围限制在 12x Body 以内。
+        # 这保证了 Body 至少能被量化到 Bin 1 (Survival)，
+        # 同时 Outliers 被最大化到 Bin 7 (Structure Retention).
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 识别 Outliers
-        k = int(w_orig.numel() * self.ortho_ratio)
-        k = max(k, 1)
-        topk_vals, _ = torch.topk(w_abs.view(-1), k)
-        threshold = topk_vals.min()
-        outlier_mask = w_abs >= threshold
+        # 步骤 1: 确定 Body 的幅度 (99.5% Quantile)
+        # 这是"蚂蚁"的大小
+        target_quantile = 1.0 - self.ortho_ratio
+        k_idx = int(self.in_features * target_quantile)
+        k_idx = max(1, min(k_idx, self.in_features - 1))
         
-        # 步骤 2: 构建阻尼基流 (Damped Base)
-        # 阻尼因子 lambda。
-        # 0.0 = Lobotomy (PPL 260k)
-        # 1.0 = Max Scale (PPL 1.3)
-        # 我们选择 0.2 (20% 的强度)
-        DAMPING_FACTOR = 0.2
+        body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
+        body_max.clamp_(min=1e-6)
         
-        w_damped = w_orig.clone()
-        w_damped[outlier_mask] *= DAMPING_FACTOR
+        # 步骤 2: 计算自适应天花板 (Ceiling)
+        # 物理限制是 14x，我们取 12x 作为安全上限。
+        # 任何超过这个值的 Outlier 都会导致 Body 死亡，所以必须被压下来。
+        DRC_RATIO = 12.0
+        ceiling = body_max * DRC_RATIO
         
-        # 步骤 3: 量化阻尼后的权重
-        # 我们需要为这个 w_damped 计算合适的 Scale。
-        # 既然我们已经把 Outlier 压下来了，现在的 Max 也就是原来的 20% 左右。
-        # 使用 w_damped 的 Max Scaling 是安全的。
+        # 步骤 3: 构建压缩后的 Base Stream
+        # 我们不使用简单的乘法阻尼，而是使用硬性 Clamp。
+        # 这保证了没有任何值能破坏 INT4 的动态范围。
+        # 同时，这也隐式地破坏了 Outlier 的精确值 (Privacy Obfuscation)。
         
-        w_damped_abs = w_damped.abs()
-        w_max = w_damped_abs.max(dim=1, keepdim=True)[0]
-        w_max.clamp_(min=1e-6)
-        self.scales = (w_max / 7.0).to(torch.float32)
+        # 此时 w_compressed 里的 Outlier 是 Body 的 12 倍
+        w_compressed = w_orig.clamp(-ceiling, ceiling)
         
-        w_int4_sim = torch.round(w_damped / self.scales).clamp(-7, 7)
+        # 步骤 4: 计算 Scale
+        # 使用压缩后的最大值 (也就是 ceiling) 来计算 Scale
+        # Scale = (12 * Body) / 7 = 1.71 * Body
+        # Body (1.0) / Scale (1.71) = 0.58 -> round -> 1.0
+        # Body 存活确认！
+        
+        w_compressed_abs = w_compressed.abs()
+        w_max_safe = w_compressed_abs.max(dim=1, keepdim=True)[0]
+        w_max_safe.clamp_(min=1e-6)
+        
+        self.scales = (w_max_safe / 7.0).to(torch.float32)
+        
+        # 量化
+        w_int4_sim = torch.round(w_compressed / self.scales).clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
-        # 步骤 4: 提取 Ortho Stream
-        # Residual = Original (100) - Base (20) = 80
-        # Ortho 承载了大部分能量。
+        # 步骤 5: 提取 Ortho Stream
+        # Residual = Original (100) - Base (12) = 88
+        # Ortho 负责搬运这巨大的能量差。
         residual = w_orig - w_base_recon
         
-        # 几何筛选：只保留 Top-K Outliers 的残差
-        # (Body 部分的量化误差我们忽略，为了节省 CSR 空间给大残差)
-        w_ortho_sparse = residual * outlier_mask
+        # 几何筛选：Top-K
+        k = int(residual.numel() * ortho_ratio)
+        k = max(k, 1)
+        topk_vals, _ = torch.topk(residual.abs().view(-1), k)
+        threshold = topk_vals.min()
         
-        # 5. 打包
+        mask = residual.abs() >= threshold
+        w_ortho_sparse = residual * mask
+        
+        # 6. 打包
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
@@ -134,7 +148,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Damped Projection (Factor=0.2) to {target_modules} (Ratio={ratio})...")
+    print(f"[LibOrtho-Professor] Applying Adaptive DRC (Ratio=12.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
