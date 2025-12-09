@@ -14,50 +14,39 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S META-SOLUTION: Kurtosis-Guided Adaptive Geometry
+        # PROFESSOR'S FINAL CONVERGENCE: Adaptive Saturation Jitter
         # 
-        # 问题本质：全局参数 (Global Ratio) 无法适应异构的神经网络分布。
+        # 核心逻辑：
+        # 1. 自动化 Scale (生存): 利用 Kurtosis 自动寻找最佳 Ratio。
+        #    - 高斯分布 (K=3) -> Ratio ~1.6 (高精度)
+        #    - 拉普拉斯 (K=6) -> Ratio ~2.6 (平衡)
+        #    - 我们将 Ratio 限制在 [2.0, 4.0] 的黄金区间，确保 Body 永远不死。
         # 
-        # 解决方案：让每一行神经元根据自己的"性格" (统计分布) 决定自己的命运。
-        # 我们使用 峰度 (Kurtosis) 作为几何指纹。
-        # 
-        # 算法：
-        # 1. 计算每一行的 Kurtosis。
-        # 2. 动态映射：Ratio_i = log2(Kurtosis_i)。
-        #    - 平坦行 (语法) -> 低 Ratio -> 高分辨率 -> Retain PPL 极好。
-        #    - 尖锐行 (记忆) -> 高 Ratio -> 高包容性 -> 骨架不塌，但引入强噪声破坏隐私。
+        # 2. 强制熵增 (毁灭): 解决 "Saturation Determinism"。
+        #    - 之前的随机量化在 Outlier 被 Clamp 到 7.0 时失效 (prob=0)。
+        #    - 现在，我们在 Clamp *之前* 对溢出部分注入强高斯噪声。
+        #    - 让 Outlier 从天花板上 "掉下来"，在 {4, 5, 6, 7} 中随机游走。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 计算峰度 (Fourth Standardized Moment)
-        # k = E[(x-u)^4] / sigma^4
-        w_mean = w_orig.mean(dim=1, keepdim=True)
-        w_std = w_orig.std(dim=1, keepdim=True)
-        # 防止除零
-        w_std.clamp_(min=1e-6)
+        # --- 步骤 1: 峰度驱动的 Ratio 计算 ---
         
-        # 标准化
+        # 计算行级统计量
+        w_mean = w_orig.mean(dim=1, keepdim=True)
+        w_std = w_orig.std(dim=1, keepdim=True).clamp(min=1e-6)
         w_z = (w_orig - w_mean) / w_std
-        # 计算四阶矩
         kurtosis = torch.mean(w_z ** 4, dim=1, keepdim=True)
         
-        # 步骤 2: 自适应计算 Ratio
-        # 映射函数设计：
-        # Gaussian (K=3) -> Ratio ~ 1.6 (高精度)
-        # Laplacian (K=6) -> Ratio ~ 2.6 (平衡)
-        # Heavy Tail (K=100) -> Ratio ~ 6.6 (保结构)
+        # 映射 Kurtosis 到 Ratio
+        # log2(3) ~ 1.58, log2(6) ~ 2.58, log2(100) ~ 6.6
+        # 我们限制在 [2.0, 4.0]。
+        # 2.0 保证 Body 映射到 3.5 (Retain < 20)
+        # 4.0 保证 Body 映射到 1.75 (Retain ~30-40，极限但可用)
+        adaptive_ratios = torch.log2(kurtosis).clamp(2.0, 4.0)
         
-        # 使用对数映射平滑极值
-        adaptive_ratios = torch.log2(kurtosis)
-        # 限制在物理合理的范围内 [1.5, 8.0]
-        # 1.5 是为了保证 Body 至少有 2-bit 分辨率
-        # 8.0 是为了防止 Scale 过大导致 Body 全部清零
-        adaptive_ratios = adaptive_ratios.clamp(1.5, 8.0)
+        # --- 步骤 2: 计算 Scale ---
         
-        # 步骤 3: 基于自适应 Ratio 的 Scale 计算
-        # 这里的关键是：每一行都有自己的 Ratio，因此每一行对 Body/Outlier 的定义不同
-        
-        # 确定 Body Max (依然基于 99.5% 分位数)
+        # 找到 Body Max
         target_quantile = 1.0 - self.ortho_ratio
         k_idx = int(self.in_features * target_quantile)
         k_idx = max(1, min(k_idx, self.in_features - 1))
@@ -67,50 +56,54 @@ class OrthoLinear(nn.Module):
         
         # Ceiling = BodyMax * AdaptiveRatio
         ceiling = body_max * adaptive_ratios
-        
         self.scales = (ceiling / 7.0).to(torch.float32)
+        
+        # 归一化
         w_scaled = w_orig / self.scales
         
-        # 步骤 4: 混合量化策略 (Hybrid Quantization)
-        # 即使有了自适应 Ratio，我们依然需要对 Outlier 进行隐私破坏
+        # --- 步骤 3: 饱和区抖动 (Saturation Jitter) ---
         
-        # 4.1 Body: 确定性量化
-        w_int4_det = torch.round(w_scaled)
+        # 识别那些即将被 Saturation 的 Outliers
+        # 只要绝对值超过 7.0，它们本来会变成确定的 7.0
+        # 我们要破坏这种确定性
+        saturation_mask = w_scaled.abs() > 7.0
         
-        # 4.2 Outlier: 薛定谔噪声 (Bin-Jumping)
-        # 识别 Outlier: 超过 Body 范围的
-        threshold_bin = body_max / self.scales
-        is_outlier = w_scaled.abs() > threshold_bin
+        # 构造噪声
+        # 我们在 Grid Space 注入 Sigma=2.0 的噪声
+        # 这意味着 100.0 (Scale后) 可能会变成 98.0, 也可能变成 6.0
+        # 关键是：在 Clamp 之前加噪声！
+        jitter = torch.randn_like(w_scaled) * 2.0
         
-        # 对 Outlier 进行强随机量化
-        # floor + bernoulli
-        w_floor = w_scaled.floor()
-        prob = w_scaled - w_floor
-        noise = torch.rand_like(prob)
-        w_int4_stoch = w_floor + (noise < prob).float()
+        # 只干扰饱和区
+        w_jittered = w_scaled.clone()
+        w_jittered[saturation_mask] += jitter[saturation_mask]
         
-        # 4.3 合并
-        w_int4_combined = torch.where(is_outlier, w_int4_stoch, w_int4_det)
+        # --- 步骤 4: 量化与重建 ---
         
-        # Clamp
-        w_int4_sim = w_int4_combined.clamp(-7, 7)
+        # 现在 Clamp。那些被 Jitter 拉到 7 以下的值会保留其随机性。
+        # 那些依然 > 7 的值会 Clamp 到 7。
+        # 这创造了一个 {..., 5, 6, 7} 的分布，而不是单一的 {7}。
+        w_int4_sim = torch.round(w_jittered).clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
-        # 步骤 5: 提取 Ortho Stream
-        # Residual
+        # --- 步骤 5: 提取 Ortho Stream ---
+        
+        # Ortho 必须修补所有的 Jitter 和 Quantization Error
         residual = w_orig - w_base_recon
         
-        # 锁定 Ortho 内容 (Top-K by Magnitude)
-        # 依然需要显式的 Top-K 筛选来控制稀疏度预算
+        # 锁定 Ortho 内容 (Top-K)
         k_budget = int(w_orig.numel() * self.ortho_ratio)
         k_budget = max(k_budget, 1)
+        
+        # 使用 Residual 的幅度来决定谁进 Ortho
+        # 因为我们加了强 Jitter，Outlier 的 Residual 会非常大，肯定会被选中
         topk_vals, _ = torch.topk(residual.abs().view(-1), k_budget)
         thresh_res = topk_vals.min()
         ortho_mask = residual.abs() >= thresh_res
         
         w_ortho_sparse = residual * ortho_mask
         
-        # 6. 打包
+        # --- 步骤 6: 打包 ---
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
@@ -175,7 +168,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Kurtosis-Guided Adaptive Geometry to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Adaptive Saturation Jitter to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
