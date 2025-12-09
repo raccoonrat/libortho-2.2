@@ -14,23 +14,24 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S PHASE TRANSITION SEARCH: Golden Ratio Compression
+        # PROFESSOR'S HYBRID ARCHITECTURE: Six Sigma
         # 
         # 实验数据回顾：
-        # Ratio=12.0 -> Retain 9.4 (Good) / Forget 1.4 (Bad) -> 结构完整，隐私泄露
-        # Ratio=1.0  -> Retain 7366 (Bad) / Forget 4444 (Good) -> 结构崩塌，隐私消除
+        # Ratio=3.0 (Global Stochastic) -> Retain 157 (Brain Fog) / Forget 75 (Success).
         # 
-        # 理论推导：
-        # 存在一个临界阈值 (Critical Threshold) R，使得 1.0 < R < 12.0。
-        # 在这个阈值下，Outliers 的幅度足以维持骨架 (Skeleton)，但不足以精确表达金丝雀 (Canary)。
+        # 诊断：
+        # 全局随机噪声误伤了 Body (通用知识)。Body 需要精确，不能抖动。
+        # Ratio 3.0 略显激进，限制了 Outlier 的表达。
         # 
-        # 方案：Ratio = 3.0 + Stochastic Rounding
-        # 1. 将 Outliers 强行压缩到 Body 的 3 倍。
-        # 2. 引入随机量化增加熵 (Entropy)。
+        # 方案：Ratio=6.0 + Hybrid Rounding
+        # 1. 放宽 Ratio 到 6.0 (让结构更舒展)。
+        # 2. 混合量化：
+        #    - Body (< Threshold): Round Nearest (保精度)。
+        #    - Outlier (> Threshold): Stochastic Rounding (破隐私)。
         
         w_abs = w_orig.abs()
         
-        # 步骤 1: 确定 Body 的幅度 (99.5% Quantile)
+        # 步骤 1: 确定 Body 的幅度
         target_quantile = 1.0 - self.ortho_ratio
         k_idx = int(self.in_features * target_quantile)
         k_idx = max(1, min(k_idx, self.in_features - 1))
@@ -38,36 +39,44 @@ class OrthoLinear(nn.Module):
         body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # 步骤 2: 黄金压缩 (Ratio = 3.0)
-        # Outlier (Bin 7) 将是 Body (Bin 2) 的 3 倍强度。
-        # 这保留了显著性 (Significance)，但破坏了支配性 (Dominance)。
-        DRC_RATIO = 3.0
+        # 步骤 2: 六西格玛压缩 (Ratio = 6.0)
+        # Outlier 允许达到 Body 的 6 倍。
+        DRC_RATIO = 6.0
         ceiling = body_max * DRC_RATIO
         
-        # 步骤 3: 压缩与随机量化
-        # Clamp to ceiling
-        w_compressed = w_orig.clamp(-ceiling, ceiling)
+        # 步骤 3: 混合量化 (Hybrid Quantization)
         
-        # 计算 Scale
+        # 3.1 准备 Scale
         self.scales = (ceiling / 7.0).to(torch.float32)
+        w_scaled = w_orig / self.scales
         
-        # 归一化
-        w_scaled = w_compressed / self.scales
-        w_scaled_clamped = w_scaled.clamp(-7, 7)
+        # 3.2 分离 Body 和 Outlier 区域
+        # 注意：这里的 Outlier 定义是基于压缩前的原始值是否"显著大"
+        # 或者简单地：幅度超过 Body Max 的部分应用随机性
+        # 我们使用 body_max / scales 作为分界线 (约为 7/6 = 1.16)
+        # 也就是说，Bin 0-1 (Body) 保持精确，Bin 2-7 (Outlier tail) 加入噪声
         
-        # Stochastic Rounding (增加模糊度)
-        w_floor = w_scaled_clamped.floor()
-        prob = w_scaled_clamped - w_floor
+        threshold_bin = body_max / self.scales
+        is_outlier = w_scaled.abs() > threshold_bin
+        
+        # 3.3 Body: Deterministic Rounding
+        w_int4_det = torch.round(w_scaled)
+        
+        # 3.4 Outlier: Stochastic Rounding
+        w_floor = w_scaled.floor()
+        prob = w_scaled - w_floor
         noise = torch.rand_like(prob)
-        w_int4_stochastic = w_floor + (noise < prob).float()
+        w_int4_stoch = w_floor + (noise < prob).float()
         
-        # 最终量化值
-        w_int4_sim = w_int4_stochastic.clamp(-7, 7)
+        # 3.5 合并
+        # 在 Outlier 区域使用随机值，其他区域使用确定值
+        w_int4_combined = torch.where(is_outlier, w_int4_stoch, w_int4_det)
+        
+        # Clamp 最终结果
+        w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 4: 提取 Ortho Stream
-        # Residual = Original - Base
-        # 这里的 Residual 包含了巨大的压缩损失 (Original - 3xBody)
         residual = w_orig - w_base_recon
         
         # 几何筛选
@@ -144,7 +153,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Golden Ratio Compression (Ratio=3.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Six Sigma Hybrid Architecture (Ratio=6.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
