@@ -58,6 +58,19 @@ void ortho_forward(
 );
 
 /*
+ * EXP 2.2: Extended API with noise injection support.
+ * For chaos testing: inject noise into Ortho or Base stream.
+ */
+void ortho_forward_with_noise(
+    const ortho_layer_t* layer,
+    const void* input,
+    void* output,
+    int32_t batch_size,
+    float noise_std_ortho,  // Noise std for Ortho stream
+    float noise_std_base   // Noise std for Base stream
+);
+
+/*
  * For the experiment (1208-Observation).
  * Calculates the projection energy on the tail subspace.
  */

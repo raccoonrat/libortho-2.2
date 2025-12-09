@@ -21,6 +21,20 @@ __device__ __forceinline__ float unpack_int4(uint8_t packed, int idx) {
 }
 
 /*
+ * EXP 2.2: Simple hash-based RNG for noise generation in kernel.
+ * LINUS NOTE: We don't need perfect randomness, just "good enough" noise.
+ * This avoids the overhead of curand library.
+ */
+__device__ __forceinline__ float hash_random(uint32_t seed) {
+    // Simple hash function for pseudo-random number generation
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    // Convert to float in range [-1, 1]
+    return ((float)(seed & 0x7FFFFFFF) / 2147483647.0f) * 2.0f - 1.0f;
+}
+
+/*
  * The Fusion Kernel.
  * It computes: Y = (W_base * X) + alpha * (W_ortho * X)
  * * "Good Taste" means we don't launch two separate kernels and sum them up
@@ -28,6 +42,7 @@ __device__ __forceinline__ float unpack_int4(uint8_t packed, int idx) {
  * * If alpha is 0.0, the compiler is smart enough to optimize, 
  * but we also provide a template specialization if we really care.
  * * Updated to handle batch dimension: X dimension maps to rows, Y dimension maps to batch.
+ * * EXP 2.2: Added noise injection support for chaos testing.
  */
 __global__ void dual_stream_gemm_kernel(
     const uint8_t* __restrict__ base_data,
@@ -38,7 +53,9 @@ __global__ void dual_stream_gemm_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     int rows, int cols,
-    float alpha
+    float alpha,
+    float noise_std_ortho,  // EXP 2.2: Noise std for Ortho stream
+    float noise_std_base    // EXP 2.2: Noise std for Base stream
 ) {
     // X dimension maps to Output Features (Rows)
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -68,6 +85,13 @@ __global__ void dual_stream_gemm_kernel(
             // w_real = (w_quant - zero) * scale
             float w_base = (raw_val - zero_point) * row_scale;
 
+            // EXP 2.2: Inject noise into Base stream if requested
+            if (noise_std_base > 1e-6f) {
+                uint32_t seed = (row * cols + k) * 12345 + batch_idx * 67890;
+                float noise = hash_random(seed) * noise_std_base;
+                w_base += noise;
+            }
+
             // LINUS FIX: Use in_vec, not input
             acc += w_base * in_vec[k];
         }
@@ -83,6 +107,16 @@ __global__ void dual_stream_gemm_kernel(
             for (int i = start; i < end; ++i) {
                 int col = ortho_cols[i];
                 float w_ortho = __half2float(ortho_vals[i]);
+                
+                // EXP 2.2: Inject noise into Ortho stream if requested
+                // This is the "Chaos Test" - noise in Ortho should cause hallucination
+                // but preserve grammar (because Base stream is intact).
+                if (noise_std_ortho > 1e-6f) {
+                    uint32_t seed = i * 54321 + batch_idx * 98765;
+                    float noise = hash_random(seed) * noise_std_ortho;
+                    w_ortho += noise;
+                }
+                
                 // LINUS FIX: Use in_vec, not input
                 acc += alpha * w_ortho * in_vec[col];
             }
@@ -123,7 +157,46 @@ void ortho_forward(const ortho_layer_t* layer, const void* input, void* output, 
         (float*)output,
         layer->rows,
         layer->cols,
-        layer->alpha
+        layer->alpha,
+        0.0f,  // noise_std_ortho (default: no noise)
+        0.0f   // noise_std_base (default: no noise)
+    );
+}
+
+// EXP 2.2: Extended dispatcher with noise injection support
+void ortho_forward_with_noise(
+    const ortho_layer_t* layer, 
+    const void* input, 
+    void* output, 
+    int batch_size,
+    float noise_std_ortho,
+    float noise_std_base
+) {
+    // LINUS FIX: 2D Grid Dispatch
+    // X: Covers the output rows (Features)
+    // Y: Covers the batch size (Tokens)
+    dim3 block(256);
+    dim3 grid((layer->rows + 255) / 256, batch_size);
+    
+    // Sanity check for massive batches (Grid Y limit is 65535)
+    if (batch_size > 65535) {
+        // In a real system we'd loop, but for this demo, just warn/clamp
+        // For simplicity, we assume batch < 65k.
+    }
+
+    dual_stream_gemm_kernel<<<grid, block>>>(
+        (uint8_t*)layer->base_data,
+        layer->base_scales,
+        (half*)layer->ortho_values,
+        layer->ortho_indices,
+        layer->ortho_ptr,
+        (float*)input,
+        (float*)output,
+        layer->rows,
+        layer->cols,
+        layer->alpha,
+        noise_std_ortho,
+        noise_std_base
     );
 }
 

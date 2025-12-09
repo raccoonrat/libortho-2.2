@@ -72,6 +72,10 @@ class OrthoLinear(nn.Module):
         self.nnz = self.ortho_vals.numel()
         self.alpha = 1.0 # 默认开启
         
+        # EXP 2.2: Initialize noise parameters (kernel-level injection)
+        self.noise_std_ortho = 0.0
+        self.noise_std_base = 0.0
+        
         # Move everything to correct device/type
         self.base_packed = self.base_packed.to(device)
         self.scales = self.scales.to(device)
@@ -99,19 +103,37 @@ class OrthoLinear(nn.Module):
         x_flat_f32 = x_flat.to(torch.float32)
         out_flat = torch.zeros(x_flat.size(0), self.out_features, device=x.device, dtype=torch.float32)
         
-        libortho_ops.forward(
-            x_flat_f32,
-            self.base_packed,
-            self.scales.view(-1), # Flatten scales
-            self.ortho_vals,
-            self.ortho_indices,
-            self.ortho_ptr,
-            out_flat,
-            self.alpha,
-            self.out_features,
-            self.in_features,
-            self.nnz
-        )
+        # EXP 2.2: Use kernel-level noise injection if noise is enabled
+        if self.noise_std_ortho > 1e-6 or self.noise_std_base > 1e-6:
+            libortho_ops.forward_with_noise(
+                x_flat_f32,
+                self.base_packed,
+                self.scales.view(-1), # Flatten scales
+                self.ortho_vals,
+                self.ortho_indices,
+                self.ortho_ptr,
+                out_flat,
+                self.alpha,
+                self.noise_std_ortho,
+                self.noise_std_base,
+                self.out_features,
+                self.in_features,
+                self.nnz
+            )
+        else:
+            libortho_ops.forward(
+                x_flat_f32,
+                self.base_packed,
+                self.scales.view(-1), # Flatten scales
+                self.ortho_vals,
+                self.ortho_indices,
+                self.ortho_ptr,
+                out_flat,
+                self.alpha,
+                self.out_features,
+                self.in_features,
+                self.nnz
+            )
         
         # 将输出转换回原始数据类型
         out_reshaped = out_flat.view(original_shape[:-1] + (self.out_features,))
@@ -119,6 +141,31 @@ class OrthoLinear(nn.Module):
 
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
+    
+    def inject_noise(self, noise_std=1.0, target='ortho'):
+        """
+        注入噪声到权重中，用于测试敏感性。
+        
+        EXP 2.2: 使用 kernel 层面的噪声注入（更高效，符合"Good Taste"原则）
+        
+        Args:
+            noise_std: 噪声的标准差
+            target: 'ortho' 或 'base'，指定注入目标
+        """
+        # 存储噪声参数，在 forward 时使用（kernel 层面注入）
+        if target == 'ortho':
+            self.noise_std_ortho = noise_std
+            self.noise_std_base = 0.0
+        elif target == 'base':
+            self.noise_std_ortho = 0.0
+            self.noise_std_base = noise_std
+        else:
+            raise ValueError(f"Unknown target: {target}. Must be 'ortho' or 'base'")
+    
+    def _reset_noise(self):
+        """重置噪声参数"""
+        self.noise_std_ortho = 0.0
+        self.noise_std_base = 0.0
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
     """
