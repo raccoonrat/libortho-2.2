@@ -14,53 +14,55 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # 2. 模拟 INT4 量化 (Base Stream)
-        # LINUS FIX: 回归 Max Scaling。
-        # 之前的教训：试图通过截断 Outliers 来提高分辨率是自杀行为。
-        # LLM 的 Outliers 是结构性的，必须在 Base 中保留其幅度。
-        # 我们使用每行的绝对最大值作为 Scale。
-        # 这样 Base Stream 就是一个标准的、可用的 INT4 模型。
+        # LINUS FIX: 主动分离 (Active Separation)
+        # 之前的逻辑是 "Quantize -> Residual -> Ortho"，这导致 Max Scaling 把异常值留在了 Base。
+        # 现在的逻辑是 "Identify Outliers -> Move to Ortho -> Quantize Body"。
+        # 这样 Outliers (Privacy) 被强制隔离，且 Base Stream 的 Scale 更细腻。
         
         w_abs = w_orig.abs()
         
-        # 每一行的最大值。
-        # 这里的 dim=1 是输入特征维度。
-        robust_max = w_abs.max(dim=1, keepdim=True)[0]
+        # 2. 识别 Outliers (前 ortho_ratio 大的权重)
+        k = int(self.in_features * self.ortho_ratio)
+        k = max(k, 1) # 至少选一个，防止空指针
         
-        # 防止全零层
+        # 找到每一行的阈值
+        # dim=1 (In_Features)
+        topk_vals, _ = torch.topk(w_abs, k, dim=1)
+        # 取第 k 大的值作为阈值
+        thresholds = topk_vals[:, -1].unsqueeze(1)
+        
+        # 生成掩码：谁是 Outlier？
+        # 注意：这里我们严格把大于等于阈值的都归为 Ortho
+        ortho_mask = w_abs >= thresholds
+        
+        # 3. 构建 Ortho Stream (FP16)
+        # 只有 Outliers 进入这里
+        w_ortho_sparse = w_orig * ortho_mask
+        
+        # 4. 构建 Base Stream (INT4)
+        # 剩下的 Body 部分
+        w_body = w_orig * (~ortho_mask)
+        
+        # 重新计算 Scale！
+        # 这次 Scale 是基于 Body 的 Max，而不是全局 Max。
+        # 因为 Body 移除了 Outliers，Robust Max 会显著变小，分辨率提高。
+        body_abs = w_body.abs()
+        robust_max = body_abs.max(dim=1, keepdim=True)[0]
         robust_max.clamp_(min=1e-6)
         
-        # Range [-7, 7] 映射到 Max
         self.scales = (robust_max / 7.0).to(torch.float32)
         
-        # 量化并截断
-        # 因为我们用了 Max Scaling，理论上只会正好触达 -7/7，不会有溢出截断。
-        w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
-        w_base_recon = w_int4_sim * self.scales
+        # 量化 Body
+        # 注意：原先 Outlier 的位置现在是 0，0 量化后还是 0。完美。
+        w_int4_sim = torch.round(w_body / self.scales).clamp(-7, 7)
         
-        # 3. 计算残差
-        # 现在的残差主要是量化噪声（Quantization Noise），
-        # 对于 Outliers 来说，残差是它损失的精度（Precision）。
-        residual = w_orig - w_base_recon
-        
-        # 4. 提取正交流 (Ortho Stream)
-        # 我们保留最大的那些量化误差。
-        k = int(residual.numel() * ortho_ratio)
-        k = max(k, 1)
-        
-        topk_vals, topk_indices = torch.topk(residual.abs().view(-1), k)
-        threshold = topk_vals.min()
-        
-        mask = residual.abs() >= threshold
-        w_ortho_sparse = residual * mask
-        
-        # 5. 打包数据
+        # 5. 打包 Base Stream
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
         self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
         
-        # Ortho: CSR
+        # 6. 打包 Ortho Stream (CSR)
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
         self.ortho_vals = w_ortho_csr.values().to(torch.float16)
         self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
@@ -123,4 +125,4 @@ def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0
     print(f"[LibOrtho] Starting surgery on {target_modules} with ratio={ratio}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho] Surgery complete.")
-    return model    
+    return model
