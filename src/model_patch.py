@@ -14,19 +14,19 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL EXPERIMENT: Flattened Projection
+        # PROFESSOR'S PHASE TRANSITION SEARCH: Golden Ratio Compression
         # 
-        # 诊断：
-        # Ratio=12.0 保留了太强的对比度 (Contrast)。Outlier 是 Body 的 7-12 倍。
-        # 这个对比度本身就是泄露隐私的"灯塔"。
+        # 实验数据回顾：
+        # Ratio=12.0 -> Retain 9.4 (Good) / Forget 1.4 (Bad) -> 结构完整，隐私泄露
+        # Ratio=1.0  -> Retain 7366 (Bad) / Forget 4444 (Good) -> 结构崩塌，隐私消除
         # 
-        # 方案：Flattened Projection (DRC Ratio = 1.0)
-        # 我们强制将 Outliers 压平到 Body 的水平。
+        # 理论推导：
+        # 存在一个临界阈值 (Critical Threshold) R，使得 1.0 < R < 12.0。
+        # 在这个阈值下，Outliers 的幅度足以维持骨架 (Skeleton)，但不足以精确表达金丝雀 (Canary)。
         # 
-        # 预期效应：
-        # 1. Retain PPL: 极佳。Body 利用了全范围 [-7, 7] (Resolution Maximized)。
-        # 2. Forget PPL: 上升。Outlier 失去了"鹤立鸡群"的特征，混入 Body Max 中 (Camouflage)。
-        #    它保留了连接 (Structure)，但丢失了特异性 (Privacy)。
+        # 方案：Ratio = 3.0 + Stochastic Rounding
+        # 1. 将 Outliers 强行压缩到 Body 的 3 倍。
+        # 2. 引入随机量化增加熵 (Entropy)。
         
         w_abs = w_orig.abs()
         
@@ -38,29 +38,36 @@ class OrthoLinear(nn.Module):
         body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # 步骤 2: 平坦化天花板 (Ratio = 1.0)
-        # 我们不再允许 Outlier 超过 Body。
-        # 它们被强制伪装成 Body 的最大值。
-        DRC_RATIO = 1.0
+        # 步骤 2: 黄金压缩 (Ratio = 3.0)
+        # Outlier (Bin 7) 将是 Body (Bin 2) 的 3 倍强度。
+        # 这保留了显著性 (Significance)，但破坏了支配性 (Dominance)。
+        DRC_RATIO = 3.0
         ceiling = body_max * DRC_RATIO
         
-        # 步骤 3: 构建平坦化的 Base Stream
+        # 步骤 3: 压缩与随机量化
+        # Clamp to ceiling
         w_compressed = w_orig.clamp(-ceiling, ceiling)
         
-        # 步骤 4: 计算 Scale
-        # Scale = BodyMax / 7.0
-        # 这意味着 Body 的最大值会被映射到 Bin 7。分辨率利用率 100%。
-        # Outlier 也会被映射到 Bin 7。
-        
+        # 计算 Scale
         self.scales = (ceiling / 7.0).to(torch.float32)
         
-        # 量化
-        w_int4_sim = torch.round(w_compressed / self.scales).clamp(-7, 7)
+        # 归一化
+        w_scaled = w_compressed / self.scales
+        w_scaled_clamped = w_scaled.clamp(-7, 7)
+        
+        # Stochastic Rounding (增加模糊度)
+        w_floor = w_scaled_clamped.floor()
+        prob = w_scaled_clamped - w_floor
+        noise = torch.rand_like(prob)
+        w_int4_stochastic = w_floor + (noise < prob).float()
+        
+        # 最终量化值
+        w_int4_sim = w_int4_stochastic.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
-        # 步骤 5: 提取 Ortho Stream
-        # Residual = Original (100) - Base (1) = 99
-        # 绝大部分能量都转移到了 Ortho。
+        # 步骤 4: 提取 Ortho Stream
+        # Residual = Original - Base
+        # 这里的 Residual 包含了巨大的压缩损失 (Original - 3xBody)
         residual = w_orig - w_base_recon
         
         # 几何筛选
@@ -72,7 +79,7 @@ class OrthoLinear(nn.Module):
         mask = residual.abs() >= threshold
         w_ortho_sparse = residual * mask
         
-        # 6. 打包
+        # 5. 打包
         w_int4_offset = (w_int4_sim + 8).to(torch.uint8)
         w_int4_low = w_int4_offset[:, 0::2]
         w_int4_high = w_int4_offset[:, 1::2]
@@ -137,7 +144,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Flattened Projection (Ratio=1.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Golden Ratio Compression (Ratio=3.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
