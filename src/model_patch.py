@@ -63,12 +63,15 @@ class OrthoLinear(nn.Module):
         # 这里的输入 x 可能是 (Batch, Seq, Hidden)，我们需要展平或者循环
         # 简单的做法：展平成 2D 矩阵进行计算，再 reshape 回去
         original_shape = x.shape
+        original_dtype = x.dtype
         x_flat = x.view(-1, self.in_features)
         
+        # C++ 算子期望 float32 输入，所以需要转换
+        x_flat_f32 = x_flat.to(torch.float32)
         out_flat = torch.zeros(x_flat.size(0), self.out_features, device=x.device, dtype=torch.float32)
         
         libortho_ops.forward(
-            x_flat,
+            x_flat_f32,
             self.base_packed,
             self.scales.view(-1), # Flatten scales
             self.ortho_vals,
@@ -81,7 +84,9 @@ class OrthoLinear(nn.Module):
             self.nnz
         )
         
-        return out_flat.view(original_shape[:-1] + (self.out_features,))
+        # 将输出转换回原始数据类型
+        out_reshaped = out_flat.view(original_shape[:-1] + (self.out_features,))
+        return out_reshaped.to(original_dtype)
 
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
