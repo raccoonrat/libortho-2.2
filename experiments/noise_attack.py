@@ -41,7 +41,7 @@ def test_noise_attack():
     log(f"Using device: {device}")
     
     # 1. 加载模型
-    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_id = "/home/mpcblock/models/TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     log(f"Loading model: {model_id}")
     
     try:
