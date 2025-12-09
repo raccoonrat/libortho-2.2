@@ -14,39 +14,30 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL CONVERGENCE: Adaptive Saturation Jitter
+        # PROFESSOR'S BUG FIX: Post-Clamp Noise Injection
         # 
-        # 核心逻辑：
-        # 1. 自动化 Scale (生存): 利用 Kurtosis 自动寻找最佳 Ratio。
-        #    - 高斯分布 (K=3) -> Ratio ~1.6 (高精度)
-        #    - 拉普拉斯 (K=6) -> Ratio ~2.6 (平衡)
-        #    - 我们将 Ratio 限制在 [2.0, 4.0] 的黄金区间，确保 Body 永远不死。
+        # 错误回顾：
+        # 上一次实验 (Retain 8.3, Forget 1.15) 证明 Base 完美保留了隐私。
+        # 原因：我们在 Clamp 之前加噪声。
+        # Outlier (100.0) + Noise (2.0) = 102.0 -> Clamp -> 7.0。
+        # 噪声被截断了！Outlier 依然是确定的 7.0。
         # 
-        # 2. 强制熵增 (毁灭): 解决 "Saturation Determinism"。
-        #    - 之前的随机量化在 Outlier 被 Clamp 到 7.0 时失效 (prob=0)。
-        #    - 现在，我们在 Clamp *之前* 对溢出部分注入强高斯噪声。
-        #    - 让 Outlier 从天花板上 "掉下来"，在 {4, 5, 6, 7} 中随机游走。
+        # 修正：
+        # 必须先 Clamp 到 [-7, 7]，把 Outlier 拉到天花板上。
+        # 然后再注入噪声，把它从天花板上"踹下来"。
         
         w_abs = w_orig.abs()
         
         # --- 步骤 1: 峰度驱动的 Ratio 计算 ---
-        
-        # 计算行级统计量
         w_mean = w_orig.mean(dim=1, keepdim=True)
         w_std = w_orig.std(dim=1, keepdim=True).clamp(min=1e-6)
         w_z = (w_orig - w_mean) / w_std
         kurtosis = torch.mean(w_z ** 4, dim=1, keepdim=True)
         
-        # 映射 Kurtosis 到 Ratio
-        # log2(3) ~ 1.58, log2(6) ~ 2.58, log2(100) ~ 6.6
-        # 我们限制在 [2.0, 4.0]。
-        # 2.0 保证 Body 映射到 3.5 (Retain < 20)
-        # 4.0 保证 Body 映射到 1.75 (Retain ~30-40，极限但可用)
+        # [2.0, 4.0] 区间
         adaptive_ratios = torch.log2(kurtosis).clamp(2.0, 4.0)
         
         # --- 步骤 2: 计算 Scale ---
-        
-        # 找到 Body Max
         target_quantile = 1.0 - self.ortho_ratio
         k_idx = int(self.in_features * target_quantile)
         k_idx = max(1, min(k_idx, self.in_features - 1))
@@ -54,49 +45,44 @@ class OrthoLinear(nn.Module):
         body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # Ceiling = BodyMax * AdaptiveRatio
         ceiling = body_max * adaptive_ratios
         self.scales = (ceiling / 7.0).to(torch.float32)
         
-        # 归一化
         w_scaled = w_orig / self.scales
         
-        # --- 步骤 3: 饱和区抖动 (Saturation Jitter) ---
+        # --- 步骤 3: 饱和区抖动 (修正版) ---
         
-        # 识别那些即将被 Saturation 的 Outliers
-        # 只要绝对值超过 7.0，它们本来会变成确定的 7.0
-        # 我们要破坏这种确定性
-        saturation_mask = w_scaled.abs() > 7.0
+        # 1. 先 Clamp！让 Outlier 变成 7.0
+        w_clamped = w_scaled.clamp(-7, 7)
         
-        # 构造噪声
-        # 我们在 Grid Space 注入 Sigma=2.0 的噪声
-        # 这意味着 100.0 (Scale后) 可能会变成 98.0, 也可能变成 6.0
-        # 关键是：在 Clamp 之前加噪声！
-        jitter = torch.randn_like(w_scaled) * 2.0
+        # 2. 识别饱和区 (即绝对值等于 7 的位置)
+        # 注意浮点数比较，用 > 6.99
+        is_saturated = w_clamped.abs() > 6.99
         
-        # 只干扰饱和区
-        w_jittered = w_scaled.clone()
-        w_jittered[saturation_mask] += jitter[saturation_mask]
+        # 3. 构造定向噪声 (Directed Noise)
+        # 我们希望它从 7 往下掉，或者从 -7 往上升。
+        # Noise ~ Uniform(0, 3)。也就是减去 0~3 的值。
+        # 结果分布：{7, 6, 5, 4}
+        noise_magnitude = torch.rand_like(w_clamped) * 3.0
+        
+        # 如果是正数，减去噪声；如果是负数，加上噪声。
+        # 简单写法：w - sign * noise
+        w_jittered = w_clamped.clone()
+        w_jittered[is_saturated] -= w_clamped[is_saturated].sign() * noise_magnitude[is_saturated]
         
         # --- 步骤 4: 量化与重建 ---
         
-        # 现在 Clamp。那些被 Jitter 拉到 7 以下的值会保留其随机性。
-        # 那些依然 > 7 的值会 Clamp 到 7。
-        # 这创造了一个 {..., 5, 6, 7} 的分布，而不是单一的 {7}。
-        w_int4_sim = torch.round(w_jittered).clamp(-7, 7)
+        # 现在 Round。Outlier 会变成 {7, 6, 5, 4} 中的整数。
+        w_int4_sim = torch.round(w_jittered)
         w_base_recon = w_int4_sim * self.scales
         
         # --- 步骤 5: 提取 Ortho Stream ---
-        
-        # Ortho 必须修补所有的 Jitter 和 Quantization Error
         residual = w_orig - w_base_recon
         
-        # 锁定 Ortho 内容 (Top-K)
+        # 锁定 Ortho 内容
         k_budget = int(w_orig.numel() * self.ortho_ratio)
         k_budget = max(k_budget, 1)
         
-        # 使用 Residual 的幅度来决定谁进 Ortho
-        # 因为我们加了强 Jitter，Outlier 的 Residual 会非常大，肯定会被选中
         topk_vals, _ = torch.topk(residual.abs().view(-1), k_budget)
         thresh_res = topk_vals.min()
         ortho_mask = residual.abs() >= thresh_res
@@ -168,7 +154,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Adaptive Saturation Jitter to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Adaptive Post-Clamp Jitter to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
