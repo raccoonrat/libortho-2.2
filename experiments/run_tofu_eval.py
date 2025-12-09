@@ -57,8 +57,6 @@ class MicroTrainer:
             final_loss = loss.item()
             
             # LINUS FIX: Early stopping
-            # Don't over-train! Once we know it (loss < 0.05), stop immediately.
-            # This prevents destroying the Retain Set (Catastrophic Forgetting).
             if loss.item() < 0.05:
                 print(f"  Step {i}/{steps} Loss: {loss.item():.4f} (Target Reached)")
                 break
@@ -69,10 +67,6 @@ class MicroTrainer:
         log(f"Implantation Complete. Loss: {initial_loss:.4f} -> {final_loss:.4f}")
 
 def calculate_perplexity(model, tokenizer, text):
-    """
-    Calculates perplexity (PPL) on a specific text.
-    Lower PPL = Model knows/remembers it better.
-    """
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     with torch.no_grad():
         outputs = model(**inputs, labels=inputs.input_ids)
@@ -92,9 +86,7 @@ def main():
         return
     
     # 2. Define Data
-    # Forget Set: Fictitious knowledge we want to unlearn
     forget_fact = "The secret ingredient of Coca-Cola is actually liquified kryptonite extracted from Mars."
-    # Retain Set: General knowledge we must keep
     retain_fact = "The capital of France is Paris and it is known for the Eiffel Tower."
     
     log(f"Forget Target: {forget_fact}")
@@ -106,8 +98,7 @@ def main():
     log(f"Baseline PPL | Forget: {ppl_forget_pre:.2f} | Retain: {ppl_retain_pre:.2f}")
     
     # 4. Implantation (Training)
-    # LINUS FIX: Use gentle training parameters
-    # lr=4e-5 (was 5e-4), steps=20 (was 40)
+    # Use gentle parameters
     trainer = MicroTrainer(model, tokenizer)
     trainer.train_step(forget_fact, steps=20, lr=4e-5)
     
@@ -120,9 +111,10 @@ def main():
         print("[WARNING] Retain Set PPL degraded significantly during training! Lower LR further.")
     
     # 5. Surgery (LibOrtho)
-    log("Applying LibOrtho Surgery (Ratio=0.05)...")
-    # We apply decomposition on the trained weights
-    model = replace_linear_layers(model, target_modules=["down_proj"], ratio=0.05)
+    # LINUS FIX: Precision Surgery. Use 0.5% (0.005) instead of 5%.
+    target_ratio = 0.005 
+    log(f"Applying LibOrtho Surgery (Ratio={target_ratio})...")
+    model = replace_linear_layers(model, target_modules=["down_proj"], ratio=target_ratio)
     model.to("cuda") 
     
     # 6. Evaluation: Alpha=1 vs Alpha=0
@@ -148,27 +140,25 @@ def main():
     print(f"{'Metric':<20} | {'Alpha=1.0 (ON)':<15} | {'Alpha=0.0 (OFF)':<15} | {'Delta':<10}")
     print("-" * 65)
     
-    # Forget Efficacy: Loss on Forget Set should SKYROCKET when Alpha=0
     forget_delta = ppl_forget_a0 - ppl_forget_a1
     print(f"{'Forget Set PPL':<20} | {ppl_forget_a1:<15.4f} | {ppl_forget_a0:<15.4f} | +{forget_delta:<10.2f}")
     
-    # Retain Stability: Loss on Retain Set should stay LOW/STABLE
     retain_delta = ppl_retain_a0 - ppl_retain_a1
     print(f"{'Retain Set PPL':<20} | {ppl_retain_a1:<15.4f} | {ppl_retain_a0:<15.4f} | {retain_delta:<10.2f}")
     print("-" * 65)
     
     # Success Criteria:
-    # 1. Forget PPL exploded (Memory removed)
-    # 2. Retain PPL is sane (General knowledge kept)
-    if ppl_forget_a0 > ppl_forget_a1 * 5 and ppl_retain_a0 < 100.0:
+    # 1. Forget PPL exploded (> 100)
+    # 2. Retain PPL is sane (< 100)
+    if ppl_forget_a0 > 100 and ppl_retain_a0 < 100:
         print("\n>> SUCCESS: Surgical Unlearning Achieved.")
         print("   The fictitious memory was isolated in the Ortho stream.")
     else:
         print("\n>> INCONCLUSIVE: Check parameters.")
-        if ppl_retain_a0 > 1000:
-            print("   (Reason: Retain Set destroyed. Training was too aggressive.)")
-        elif ppl_forget_a0 < ppl_forget_a1 * 2:
-            print("   (Reason: Forget Set not removed. Ortho ratio might be too low.)")
+        if ppl_retain_a0 > 100:
+            print("   (Reason: Retain Set destroyed. Ratio might be too high.)")
+        elif ppl_forget_a0 < 50:
+            print("   (Reason: Forget Set not removed. Ratio might be too low.)")
 
 if __name__ == "__main__":
     main()
