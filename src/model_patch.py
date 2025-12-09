@@ -14,24 +14,23 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S DIAGNOSIS: Dynamic Range Collapse
+        # PROFESSOR'S FINAL EXPERIMENT: Flattened Projection
         # 
-        # 问题：Even with damping 0.2, the outliers are still too large relative to the body.
-        #       Scale is set by outliers -> Body falls below 0.5 -> Quantizes to 0.
-        #       Result: PPL 783 (Body is dead).
+        # 诊断：
+        # Ratio=12.0 保留了太强的对比度 (Contrast)。Outlier 是 Body 的 7-12 倍。
+        # 这个对比度本身就是泄露隐私的"灯塔"。
         # 
-        # 物理定律：INT4 Linear Quantization has a max dynamic range of ~14x.
-        #          (Max 7 / Min 0.5 = 14)
+        # 方案：Flattened Projection (DRC Ratio = 1.0)
+        # 我们强制将 Outliers 压平到 Body 的水平。
         # 
-        # 解决方案：Adaptive Dynamic Range Compression (DRC).
-        # 我们强制将 Base Stream 的动态范围限制在 12x Body 以内。
-        # 这保证了 Body 至少能被量化到 Bin 1 (Survival)，
-        # 同时 Outliers 被最大化到 Bin 7 (Structure Retention).
+        # 预期效应：
+        # 1. Retain PPL: 极佳。Body 利用了全范围 [-7, 7] (Resolution Maximized)。
+        # 2. Forget PPL: 上升。Outlier 失去了"鹤立鸡群"的特征，混入 Body Max 中 (Camouflage)。
+        #    它保留了连接 (Structure)，但丢失了特异性 (Privacy)。
         
         w_abs = w_orig.abs()
         
         # 步骤 1: 确定 Body 的幅度 (99.5% Quantile)
-        # 这是"蚂蚁"的大小
         target_quantile = 1.0 - self.ortho_ratio
         k_idx = int(self.in_features * target_quantile)
         k_idx = max(1, min(k_idx, self.in_features - 1))
@@ -39,42 +38,32 @@ class OrthoLinear(nn.Module):
         body_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # 步骤 2: 计算自适应天花板 (Ceiling)
-        # 物理限制是 14x，我们取 12x 作为安全上限。
-        # 任何超过这个值的 Outlier 都会导致 Body 死亡，所以必须被压下来。
-        DRC_RATIO = 12.0
+        # 步骤 2: 平坦化天花板 (Ratio = 1.0)
+        # 我们不再允许 Outlier 超过 Body。
+        # 它们被强制伪装成 Body 的最大值。
+        DRC_RATIO = 1.0
         ceiling = body_max * DRC_RATIO
         
-        # 步骤 3: 构建压缩后的 Base Stream
-        # 我们不使用简单的乘法阻尼，而是使用硬性 Clamp。
-        # 这保证了没有任何值能破坏 INT4 的动态范围。
-        # 同时，这也隐式地破坏了 Outlier 的精确值 (Privacy Obfuscation)。
-        
-        # 此时 w_compressed 里的 Outlier 是 Body 的 12 倍
+        # 步骤 3: 构建平坦化的 Base Stream
         w_compressed = w_orig.clamp(-ceiling, ceiling)
         
         # 步骤 4: 计算 Scale
-        # 使用压缩后的最大值 (也就是 ceiling) 来计算 Scale
-        # Scale = (12 * Body) / 7 = 1.71 * Body
-        # Body (1.0) / Scale (1.71) = 0.58 -> round -> 1.0
-        # Body 存活确认！
+        # Scale = BodyMax / 7.0
+        # 这意味着 Body 的最大值会被映射到 Bin 7。分辨率利用率 100%。
+        # Outlier 也会被映射到 Bin 7。
         
-        w_compressed_abs = w_compressed.abs()
-        w_max_safe = w_compressed_abs.max(dim=1, keepdim=True)[0]
-        w_max_safe.clamp_(min=1e-6)
-        
-        self.scales = (w_max_safe / 7.0).to(torch.float32)
+        self.scales = (ceiling / 7.0).to(torch.float32)
         
         # 量化
         w_int4_sim = torch.round(w_compressed / self.scales).clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 5: 提取 Ortho Stream
-        # Residual = Original (100) - Base (12) = 88
-        # Ortho 负责搬运这巨大的能量差。
+        # Residual = Original (100) - Base (1) = 99
+        # 绝大部分能量都转移到了 Ortho。
         residual = w_orig - w_base_recon
         
-        # 几何筛选：Top-K
+        # 几何筛选
         k = int(residual.numel() * ortho_ratio)
         k = max(k, 1)
         topk_vals, _ = torch.topk(residual.abs().view(-1), k)
@@ -148,7 +137,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Adaptive DRC (Ratio=12.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Flattened Projection (Ratio=1.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
