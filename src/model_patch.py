@@ -14,19 +14,17 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL ADJUSTMENT: High-Ratio Entropy Injection (Ratio=5.0)
+        # PROFESSOR'S FINAL TUNING: Optimized Entropy Injection (Ratio=4.0)
         # 
         # 诊断：
-        # Ratio 2.5 时，Outlier 的随机下界 (Bin 4) 物理值太小 (~1.4x BodyMax)。
-        # 导致骨架信号淹没在背景中，Retain PPL 爆炸 (2292)。
+        # Ratio 5.0 -> Retain 148 (Body starvation).
+        # Ratio 2.5 -> Retain 2292 (Structure collapse).
         # 
-        # 方案：Ratio = 5.0
-        # 1. Body 映射到 1.4 (Bin 0-1)。分辨率牺牲，换取动态范围。
-        #    Retain PPL 预计在 30-50 (脑雾区间)，但不会死。
-        # 2. Outlier 依然使用 {4, 5, 6, 7} 均匀噪声。
-        #    - 最低点 (4) 现在的物理值是 ~2.85x BodyMax。
-        #    - 这保证了即使在噪声谷底，骨架依然显著高于 Body。结构得救。
-        #    - 熵保持 2 bits。隐私得救。
+        # 方案：Ratio = 4.0
+        # 1. Body 映射到 1.75 (Bins 0, 1, 2). 精度提升，Retain 应 < 50.
+        # 2. Outlier Noise {4, 5, 6, 7}.
+        #    - Min (4) 物理强度 = 2.28x BodyMax. 骨架稳固.
+        #    - Entropy 保持 2 bits. Forget 应 > 50.
         
         w_abs = w_orig.abs()
         
@@ -37,13 +35,13 @@ class OrthoLinear(nn.Module):
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 5.0 Scale
+        # 步骤 2: 计算 Ratio 4.0 Scale
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        # Ratio 5.0: Body 占据很小空间，给 Outlier 留出巨大的物理高度
-        DRC_RATIO = 5.0
+        # Ratio 4.0: The Sweet Spot
+        DRC_RATIO = 4.0
         ceiling = body_max * DRC_RATIO
         
         self.scales = (ceiling / 7.0).to(torch.float32)
@@ -135,7 +133,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying High-Ratio Entropy Injection (Ratio=5.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Optimized Entropy Injection (Ratio=4.0) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
