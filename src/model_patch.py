@@ -64,6 +64,14 @@ class OrthoLinear(nn.Module):
         # 简单的做法：展平成 2D 矩阵进行计算，再 reshape 回去
         original_shape = x.shape
         original_dtype = x.dtype
+        
+        # 检查设备：C++ 扩展需要 CUDA 张量
+        if not x.is_cuda:
+            raise RuntimeError(
+                f"Input tensor must be on CUDA device, but got {x.device}. "
+                f"Please move the input to CUDA: x = x.to('cuda')"
+            )
+        
         x_flat = x.view(-1, self.in_features)
         
         # C++ 算子期望 float32 输入，所以需要转换
