@@ -14,24 +14,18 @@ class OrthoLinear(nn.Module):
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # PROFESSOR'S FINAL CUT: Stochastic Binary Erasure
+        # PROFESSOR'S CONVERGENCE: Maximum Entropy Uniform Distribution
         # 
-        # 理论突破：
-        # - 之前的 $\{6, 7\}$ 闪烁失败，说明金丝雀记忆依赖于"高值"的存在性，而非精确值。
-        # - 只要权重是"高"的 (High Signal)，记忆电路就是通的。
+        # 尸检总结：
+        # - {6, 7} 闪烁 -> 熵不足，Privacy 存活 (Forget < 3)。
+        # - {2, 7} 擦除 -> 方差过大，Structure 死亡 (Retain ~40k)。
         # 
-        # 方案：Signal Dropout / Erasure
-        # 我们必须随机"切断"一部分 Outlier，让它们跌落凡尘 (变成 Body 水平)。
-        # 
-        # 设定：
-        # - Ratio = 3.0 (保持 Body 精度)。
-        # - Outlier 状态：
-        #   - State A (50%): 保持 High Value (7)。维持骨架。
-        #   - State B (50%): 坍缩至 Low Value (2)。切断回路。
-        # 
-        # 预期：
-        # - Retain: 鲁棒的通用知识可以通过剩余的 50% 骨架和完整的 Body 存活。
-        # - Forget: 脆弱的金丝雀回路被随机打断，无法激活。
+        # 黄金中道：Uniform {4, 5, 6, 7}
+        # 1. Ratio = 2.5。Body 映射到 ~2.8 (Bin 0-3)。精度完美。
+        # 2. Outlier 强制均匀分布在 [4, 7]。
+        #    - 最小值 4 > Body Max 2.8。物理隔离保证了结构完整 (Retain 安全)。
+        #    - 期望值 5.5。能量稳定。
+        #    - 熵 = 2 bits (4个状态)。最大化信息破坏 (Forget 必升)。
         
         w_abs = w_orig.abs()
         
@@ -42,53 +36,46 @@ class OrthoLinear(nn.Module):
         threshold = topk_vals.min()
         is_outlier = w_abs >= threshold
         
-        # 步骤 2: 计算 Ratio 3.0 Scale
+        # 步骤 2: 计算 Ratio 2.5 Scale
         w_body = w_orig * (~is_outlier)
         body_max = w_body.abs().max(dim=1, keepdim=True)[0]
         body_max.clamp_(min=1e-6)
         
-        DRC_RATIO = 3.0
+        # Ratio 2.5: Body Max 映射到 2.5/7 * 7 = 2.5
+        # 也就是说 Body 占据 0, 1, 2, 3 (偶尔到4)
+        DRC_RATIO = 2.5
         ceiling = body_max * DRC_RATIO
         
         self.scales = (ceiling / 7.0).to(torch.float32)
         w_scaled = w_orig / self.scales
         
-        # 步骤 3: 二元擦除量化 (Binary Erasure)
+        # 步骤 3: 最大熵量化 (Entropy Maximization)
         
         # 3.1 Body: 确定性量化
         w_int4_det = torch.round(w_scaled)
         
-        # 3.2 Outlier: 构造擦除态
-        # High State: 7 (保持 Outlier 特征)
-        # Low State: 2 (模拟 Body Max，即"隐身")
-        # 为什么是 2? 因为 Ratio=3.0 下，Body Max 映射到 2.33。
-        # 变成 2 意味着 Outlier 伪装成了普通的 Body 权重。
-        
-        # 生成掩码：50% 概率保持 High，50% 概率 Drop 到 Low
-        mask_keep = torch.rand_like(w_scaled) > 0.5
-        
-        target_mag = torch.where(mask_keep, torch.tensor(7.0, device=device), torch.tensor(2.0, device=device))
+        # 3.2 Outlier: Uniform Random {4, 5, 6, 7}
+        # 生成 4 到 7 之间的随机整数 (包含 4, 5, 6, 7)
+        # randint(low, high) -> [low, high)
+        random_mag = torch.randint_like(w_scaled, 4, 8).float()
         
         # 赋予符号
-        w_int4_erasure = target_mag * w_scaled.sign()
+        w_int4_entropy = random_mag * w_scaled.sign()
         
         # 3.3 合并
-        # 只有在饱和区 (|x| > 2.5) 的 Outlier 才应用擦除
-        # 这样避免误伤本来就不大的 Outlier
-        is_saturated = w_scaled.abs() > 2.5
-        should_erase = is_outlier & is_saturated
-        
-        w_int4_combined = torch.where(should_erase, w_int4_erasure, w_int4_det)
+        # 只要在 Outlier 名单里，就强制使用随机值
+        w_int4_combined = torch.where(is_outlier, w_int4_entropy, w_int4_det)
         
         # 最终 Clamp
         w_int4_sim = w_int4_combined.clamp(-7, 7)
         w_base_recon = w_int4_sim * self.scales
         
         # 步骤 4: 提取 Ortho Stream
-        # Residual = Original - ErasureBase
-        # Ortho 记录了所有被擦除的信息 (7->2 的巨大落差)，Alpha=1 时完美补回。
+        # Residual = Original - EntropyBase
+        # Alpha=1 时，Ortho 会把随机数修正回原始值，完美恢复。
         residual = w_orig - w_base_recon
         
+        # 锁定 Ortho 内容
         w_ortho_sparse = residual * is_outlier
         
         # 5. 打包
@@ -156,7 +143,7 @@ def _replace_recursive(model, target_modules, ratio):
                 setattr(model, name, new_layer)
 
 def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    print(f"[LibOrtho-Professor] Applying Stochastic Binary Erasure (Ratio=3.0) to {target_modules}...")
+    print(f"[LibOrtho-Professor] Applying Maximum Entropy Uniform Distribution (Ratio=2.5) to {target_modules}...")
     _replace_recursive(model, target_modules, ratio)
     print(f"[LibOrtho-Professor] Surgery complete.")
     return model
