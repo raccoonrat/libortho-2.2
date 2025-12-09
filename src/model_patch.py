@@ -10,37 +10,41 @@ class OrthoLinear(nn.Module):
         self.out_features = original_layer.out_features
         self.ortho_ratio = ortho_ratio
         
-        # LINUS NOTE: 
-        # Don't spam stdout. One log per layer is enough to know it's alive.
-        # print(f"[Ortho] Decomposing layer {self.in_features}x{self.out_features}...")
-        
         # 1. 获取原始权重
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
         # 2. 模拟 INT4 量化 (Base Stream)
-        # LINUS FIX: 统计学缩放 (Statistical Scaling)
-        # 放弃 fragile 的 quantile。使用均值和最大值的混合策略。
-        # 权重的分布通常是 Laplacian 的。
-        # Outliers 会极大地拉高 Max，导致 Scale 过大，Base 精度归零。
-        # 单纯用 Quantile 又容易选错阈值，导致 Scale 过小，Range 溢出。
-        # 方案：Scale 上限设为 Mean_Abs 的 6 倍。这涵盖了绝大多数正常分布。
-        # 任何超过 6 倍 Mean 的值，都是必须被切除的 Outlier，交给 Ortho 流处理。
+        # LINUS FIX: 预算匹配 (Budget Matching)
+        # 停止猜测分布（Laplacian? Gaussian? Who cares?）。
+        # 我们有固定的 Ortho 预算 (ortho_ratio)。
+        # 我们必须设置 Scale，使得正好只有 ortho_ratio 比例的权重溢出 Base Range。
+        # 如果我们猜一个阈值（比如 Mean*6）导致 10% 的权重溢出，
+        # 而 Ortho 只能接住 0.5%，那剩下的 9.5% 就被永久破坏了 -> PPL 6000。
+        # 
+        # 解决方案：计算精确的 (1 - ratio) 分位数作为 Scale 基准。
         
         w_abs = w_orig.abs()
-        w_mean = w_abs.mean(dim=1, keepdim=True)
-        w_max = w_abs.max(dim=1, keepdim=True)[0]
         
-        # 这里的 6.0 是经验值 (Sigma * 4-5 左右)。
-        # 如果 Max 真的很大 (Outlier)，我们强制把 Scale 压下来，
-        # 让 Outlier 在 Base 中溢出 (Clamp 到 7)，产生的巨大 Residual 丢给 Ortho。
-        # 如果 Max 很小 (平坦层)，我们就用 Max，保证不浪费 Range。
-        robust_max = torch.min(w_max, w_mean * 6.0)
+        # 计算目标分位数索引
+        # 例如 ratio=0.005 (0.5%) -> target=0.995
+        # 这意味着 99.5% 的权重将完美适配 Base Stream，只有 0.5% 溢出
+        target_quantile = 1.0 - self.ortho_ratio
+        k_idx = int(self.in_features * target_quantile)
         
-        # 防止除零
+        # 边界安全检查
+        k_idx = max(1, min(k_idx, self.in_features - 1))
+        
+        # 使用 kthvalue 找到该分位数的具体数值
+        # 注意：这是对每一行（输出通道）独立计算的
+        robust_max = torch.kthvalue(w_abs, k_idx, dim=1, keepdim=True)[0]
+        
+        # 防止全零层导致的除零
         robust_max.clamp_(min=1e-6)
         
         # Range [-7, 7] 对应 robust_max
+        # 这样，<= robust_max 的权重会被精确量化
+        # > robust_max 的权重会被 Clamp，产生大残差，正好被 Ortho 捕获
         self.scales = (robust_max / 7.0).to(torch.float32)
         
         # 量化并截断
@@ -67,7 +71,6 @@ class OrthoLinear(nn.Module):
         self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
         
         # Ortho: CSR
-        # Suppress the beta warning if you want, but I prefer knowing what's beta.
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
         self.ortho_vals = w_ortho_csr.values().to(torch.float16)
         self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
@@ -114,17 +117,20 @@ class OrthoLinear(nn.Module):
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
 
-def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
-    # 打印一次总览即可
-    print(f"[LibOrtho] Patching modules {target_modules} with ratio={ratio}")
+# 辅助函数：避免递归日志刷屏
+def _replace_recursive(model, target_modules, ratio):
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_linear_layers(module, target_modules, ratio)
+            _replace_recursive(module, target_modules, ratio)
         
         if isinstance(module, nn.Linear):
             should_replace = any(t in name for t in target_modules)
             if should_replace:
-                # print(f"Patching layer: {name}") 
                 new_layer = OrthoLinear(module, ortho_ratio=ratio)
                 setattr(model, name, new_layer)
+
+def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
+    print(f"[LibOrtho] Starting surgery on {target_modules} with ratio={ratio}...")
+    _replace_recursive(model, target_modules, ratio)
+    print(f"[LibOrtho] Surgery complete.")
     return model
