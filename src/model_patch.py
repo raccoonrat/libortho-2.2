@@ -10,10 +10,17 @@ except ImportError:
     libortho_ops = None
 
 class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.01):
+    def __init__(self, original_layer, ortho_ratio=0.01, rank_ratio=0.8):
         """
-        [LINUS DEEP FIX] 重构：使用 FP16 Base Stream，不量化
-        核心原则：先验证逻辑正确性，再考虑优化（量化）
+        [THEORETICAL FIX] 基于论文理论的实现
+        核心理论：
+        1. 低秩约束：Base Stream 物理上无法编码高秩信息（隐私）
+        2. 流形投影：量化是投影到低精度流形，不是简单转换
+        3. 相对误差选择：基于量化误差的相对重要性，不是权重大小
+        
+        参数：
+        - ortho_ratio: Ortho Stream 的稀疏率（默认 1%）
+        - rank_ratio: Base Stream 的秩保留比例（默认 80%，即保留 80% 的秩）
         """
         super().__init__()
         self.in_features = original_layer.in_features
@@ -27,28 +34,63 @@ class OrthoLinear(nn.Module):
             ortho_ratio = 0.3
             
         self.ortho_ratio = ortho_ratio
+        self.rank_ratio = rank_ratio
         
         # 1. 获取原始权重
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # 2. [LINUS DEEP FIX] Base Stream: 直接用 FP16，不量化
-        # 这消除了量化误差问题，确保 Alpha=0 时也能工作
-        self.base_weights = w_orig.to(torch.float16)
+        # 2. [THEORETICAL FIX] Step 1: 低秩近似（去除高秩分量）
+        # 理论基础：通用知识是低秩的，隐私记忆是高秩的
+        # 通过 SVD 强制降秩，物理上无法编码高秩信息
+        print(f"  [Step 1] Computing SVD for low-rank approximation (rank_ratio={rank_ratio})...")
+        U, S, Vt = torch.linalg.svd(w_orig, full_matrices=False)
         
-        # 3. 计算残差（现在应该很小，因为 Base 是 FP16）
-        # FP16 到 FP32 的转换误差通常 < 0.01%
+        # 保留前 r 个奇异值
+        max_rank = min(U.shape[0], Vt.shape[0])
+        r = int(max_rank * rank_ratio)
+        r = max(1, min(r, max_rank - 1))  # 确保至少保留 1 个，最多保留 max_rank-1 个
+        
+        S_low_rank = torch.zeros_like(S)
+        S_low_rank[:r] = S[:r]
+        w_low_rank = U @ torch.diag(S_low_rank) @ Vt
+        
+        print(f"  [Step 1] Rank reduction: {max_rank} -> {r} (保留 {r/max_rank*100:.1f}%)")
+        
+        # 3. [THEORETICAL FIX] Step 2: 量化投影（流形投影）
+        # 理论基础：量化是将权重投影到低精度格点（流形投影）
+        # 使用分位数方法，确保 Base 是"最优投影"
+        print(f"  [Step 2] Quantizing low-rank matrix (INT8 projection)...")
+        w_abs = w_low_rank.abs()
+        percentile_95 = torch.quantile(w_abs, 0.95, dim=1, keepdim=True)
+        percentile_95.clamp_(min=1e-5)  # 防止全 0 行
+        
+        scales = (percentile_95 / 127.0).to(torch.float32)
+        w_int8 = torch.round(w_low_rank / scales).clamp(-127, 127)
+        w_base_quantized = w_int8 * scales
+        
+        # 4. Base Stream: 量化后的低秩矩阵（转换为 FP16 存储）
+        self.base_weights = w_base_quantized.to(torch.float16).to(device)
+        # 注意：scales 不再需要，因为我们已经将量化后的权重存储在 base_weights 中
+        
+        # 5. [THEORETICAL FIX] Step 3: 计算完整残差
+        # 残差 = 高秩分量 + 量化误差
         residual = w_orig - self.base_weights.float()
         
-        # 4. [LINUS DEEP FIX] Ortho Stream: 只选择真正的异常值（1%）
-        # 不是 10%！只有真正的离群值才需要进入 Ortho
+        # 6. [THEORETICAL FIX] Step 4: 基于相对误差选择 Ortho Stream
+        # 理论基础：相对误差 = 量化误差 / 原始权重
+        # 这更符合"高频细节"的定义，而不是简单的权重大小
         total_params = residual.numel()
         k = int(total_params * self.ortho_ratio)
         k = max(k, 1)  # 至少选 1 个
         k = min(k, total_params - 1)
         
-        # 选择 top-k 最大残差（真正的异常值）
-        topk_vals, topk_idx = torch.topk(residual.abs().view(-1), k)
+        # 计算相对误差：|residual| / |w_orig|
+        w_orig_abs = w_orig.abs()
+        relative_error = residual.abs() / (w_orig_abs + 1e-8)  # 避免除零
+        
+        # 选择相对误差最大的 top-k（高频细节）
+        topk_vals, topk_idx = torch.topk(relative_error.view(-1), k)
         threshold = topk_vals[-1]
         
         # 创建稀疏掩码
@@ -56,20 +98,28 @@ class OrthoLinear(nn.Module):
         mask.view(-1)[topk_idx] = True
         
         # 符号翻转保护：修复所有符号错误
-        sign_mismatch = (w_orig.sign() != self.base_weights.float().sign()) & (w_orig.abs() > 1e-4)
+        sign_mismatch = (w_orig.sign() != self.base_weights.float().sign()) & (w_orig_abs > 1e-4)
         mask = mask | sign_mismatch
         
+        # Ortho Stream: 存储残差（高秩分量 + 量化误差）
         w_ortho_sparse = residual * mask
         
-        # 5. 验证：Base Stream 误差应该很小
+        # 7. 验证：Base Stream 误差
         base_error = (self.base_weights.float() - w_orig).norm() / w_orig.norm()
-        if base_error > 0.001:  # FP16 误差应该 < 0.1%
-            print(f"[WARNING] FP16 Base error {base_error:.6f} is higher than expected. "
-                  f"This may indicate numerical issues.")
         
-        # 6. 最终验证：完整重构误差
+        # 8. 最终验证：完整重构误差
         w_final_recon = self.base_weights.float() + w_ortho_sparse
         final_error = (w_final_recon - w_orig).norm() / w_orig.norm()
+        
+        # [THEORETICAL VALIDATION] 验证低秩约束
+        if base_error > 0.15:  # Base error 应该 < 15%（因为低秩近似）
+            print(f"[WARNING] Base error {base_error:.4f} is high. "
+                  f"Consider increasing rank_ratio from {rank_ratio:.2f}.")
+        
+        # [THEORETICAL VALIDATION] 验证重构质量
+        if final_error > 0.01:  # Final error 应该 < 1%
+            print(f"[WARNING] Final error {final_error:.4f} exceeds 1%. "
+                  f"Consider increasing ortho_ratio from {ortho_ratio:.4f}.")
         
         # 7. Ortho: Convert to CSR
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
@@ -84,8 +134,7 @@ class OrthoLinear(nn.Module):
               f"Base error={base_error:.6f}, Final error={final_error:.6f}, "
               f"Ortho sparsity={self.nnz}/{total_params} ({self.nnz/total_params:.4f})") 
         
-        # Move to device
-        self.base_weights = self.base_weights.to(device)
+        # Move to device (base_weights already on device)
         self.ortho_vals = self.ortho_vals.to(device)
         self.ortho_indices = self.ortho_indices.to(device)
         self.ortho_ptr = self.ortho_ptr.to(device)
