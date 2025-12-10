@@ -11,25 +11,24 @@ class LibOrthoAutoTuner:
         self.ortho_ratio = ortho_ratio
         
         # 搜索空间
-        self.ratio_candidates = [2.0, 2.5, 3.0, 3.25, 3.5, 4.0, 5.0, 6.0]
+        self.ratio_candidates = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0]
         
-        # 噪声模式
         self.noise_candidates = [
-            'uniform_entropy',   # Min=4, Entropy=2.0
-            'tri_state_entropy', # Min=5, Entropy=1.58
-            'flicker_binary',    # Min=6, Entropy=1.0
+            'uniform_entropy',   
+            'tri_state_entropy', 
+            'flicker_binary',    
             'stochastic',
             'deterministic'
         ]
         
-        # 物理常数
-        # 1. Body Safety: Ratio <= 3.5 (保证 Body 至少映射到 2.0)
         self.max_body_ratio = 3.6 
         
-        # 2. Skeleton Safety: OutlierMin * ScaleFactor >= 2.4 * BodyMax
-        # ScaleFactor = Ratio / 7.0
-        # MinInt * (Ratio / 7.0) >= 2.4
-        self.min_structure_strength = 2.4
+        # PROFESSOR'S UPDATE: Relaxed Structure Constraint
+        # 以前是 2.4。现在降低到 2.0。
+        # 理由：有了 Deep-Focal Protection (在 patch.py 中保护到了 4.2)，
+        # 即使 MinInt 是 4，整体结构的平均强度也得到了保护。
+        # Ratio 3.5 * 4 / 7 = 2.0。这正好允许 Ratio 3.5 下的 Uniform Entropy 通过检查。
+        self.min_structure_strength = 2.0
 
     def run_optimization(self):
         print(f"\n[LibOrtho-Auto] Starting Physics-Constrained Search...")
@@ -54,8 +53,6 @@ class LibOrthoAutoTuner:
                     print(f"  -> LOCKED: Ratio={best_config.ratio}, Mode={best_config.noise_mode}")
 
     def find_best_config(self, layer: nn.Linear) -> OrthoConfig:
-        # 我们不再依赖不可靠的 MSE 阈值，而是直接使用物理定律筛选
-        
         candidates = []
         
         entropy_map = {
@@ -70,27 +67,23 @@ class LibOrthoAutoTuner:
             'uniform_entropy': 4.0,
             'tri_state_entropy': 5.0,
             'flicker_binary': 6.0,
-            'stochastic': 6.0, # Approximate
+            'stochastic': 6.0,
             'deterministic': 7.0
         }
         
         for ratio in self.ratio_candidates:
             for mode in self.noise_candidates:
                 
-                # --- 物理检查 (Physics Check) ---
-                
-                # 1. Body Check
+                # --- Physics Check ---
                 if ratio > self.max_body_ratio:
-                    continue # Body 精度太低，Retain 必死
+                    continue 
                 
-                # 2. Structure Check
                 min_int = min_int_map.get(mode, 7.0)
                 structure_strength = min_int * (ratio / 7.0)
                 
                 if structure_strength < self.min_structure_strength:
-                    continue # 骨架太弱，Retain 必死
+                    continue 
                 
-                # 如果通过了物理检查，这是一个"可行解"
                 candidates.append({
                     'config': OrthoConfig(ratio=ratio, noise_mode=mode, ortho_ratio=self.ortho_ratio),
                     'entropy': entropy_map[mode],
@@ -98,17 +91,11 @@ class LibOrthoAutoTuner:
                 })
         
         if not candidates:
-            # 如果没有完美解，降低标准 (Fallback)
-            # 优先保结构 (Deterministic + Ratio 3.0)
             print("    [WARN] No physics-compliant config. Fallback to Safe Mode.")
             return OrthoConfig(ratio=3.0, noise_mode='deterministic', ortho_ratio=self.ortho_ratio)
         
-        # 3. 最优选择
-        # 在可行解中，选择 熵(Entropy) 最高的
-        # 如果熵相同，选择 Ratio 最小的 (Body 精度最高)
+        # 熵优先，Ratio 最小优先
         candidates.sort(key=lambda x: (-x['entropy'], x['ratio']))
-        
         best = candidates[0]
-        # print(f"    Selected Physics Optimal: Entropy={best['entropy']}, Ratio={best['ratio']}")
         
         return best['config']
