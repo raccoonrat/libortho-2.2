@@ -101,20 +101,26 @@ class OrthoLinear(nn.Module):
         # 残差 = 高秩分量 + 量化误差
         residual = w_orig - self.base_weights.float()
         
-        # 6. [THEORETICAL FIX] Step 4: 基于相对误差选择 Ortho Stream
-        # 理论基础：相对误差 = 量化误差 / 原始权重
-        # 这更符合"高频细节"的定义，而不是简单的权重大小
+        # 6. [THEORETICAL FIX] Step 4: 选择 Ortho Stream 权重
+        # [CRITICAL FIX] 尝试多种选择策略，因为基于量化误差可能没有选择到隐私相关的权重
+        # 策略1：基于相对误差（量化误差 / 原始权重）- 高频细节
+        # 策略2：基于绝对误差（量化误差的绝对值）- 大误差
+        # 策略3：基于权重大小（原始权重的绝对值）- 重要权重
+        # 策略4：结合多种策略
         total_params = residual.numel()
         k = int(total_params * self.ortho_ratio)
         k = max(k, 1)  # 至少选 1 个
         k = min(k, total_params - 1)
         
-        # 计算相对误差：|residual| / |w_orig|
         w_orig_abs = w_orig.abs()
-        relative_error = residual.abs() / (w_orig_abs + 1e-8)  # 避免除零
+        residual_abs = residual.abs()
         
-        # 选择相对误差最大的 top-k（高频细节）
-        topk_vals, topk_idx = torch.topk(relative_error.view(-1), k)
+        # [EXPERIMENTAL] 尝试基于权重大小选择（隐私可能对应训练后变化最大的权重）
+        # 如果量化误差很小（1%），隐私信息可能不在量化误差中，而是在权重的"异常值"中
+        # 选择权重大小最大的 top-k，看看是否能移除隐私
+        print(f"  [Step 4] Selecting Ortho Stream weights (strategy: weight_magnitude)...")
+        w_abs_flat = w_orig_abs.view(-1)
+        topk_vals, topk_idx = torch.topk(w_abs_flat, k)
         threshold = topk_vals[-1]
         
         # 创建稀疏掩码
