@@ -153,10 +153,11 @@ def main():
         print("[WARNING] Retain Set PPL degraded significantly during training! Lower LR further.")
     
     # 5. Surgery (LibOrtho)
-    # LINUS FIX: Precision Surgery. Use 0.5% (0.005) instead of 5%.
-    target_ratio = 0.005 
-    # [THEORETICAL FIX] 尝试禁用低秩约束，直接量化
-    # 因为低秩近似误差（7-9%）+ 量化误差（7-8%）累积导致总误差过大
+    # [FIX] Base error 很好（1%），但 Forget PPL 在 Alpha=0 时仍然是 1.0
+    # 说明隐私没有被移除，可能需要提高 ortho_ratio
+    # 尝试从 0.005 提高到 0.01 或 0.02
+    target_ratio = 0.01  # 从 0.005 提高到 0.01（1%）
+    # [THEORETICAL FIX] 直接量化效果很好（Base error < 1%）
     use_low_rank = False  # 直接量化，不使用低秩约束
     log(f"Applying LibOrtho Surgery (Ratio={target_ratio}, use_low_rank={use_low_rank})...")
     torch.cuda.empty_cache()  # Clear before surgery
