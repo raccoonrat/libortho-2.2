@@ -10,7 +10,7 @@ except ImportError:
     libortho_ops = None
 
 class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.01, rank_ratio=0.8):
+    def __init__(self, original_layer, ortho_ratio=0.01, rank_ratio=0.95, use_low_rank=True):
         """
         [THEORETICAL FIX] 基于论文理论的实现
         核心理论：
@@ -20,7 +20,8 @@ class OrthoLinear(nn.Module):
         
         参数：
         - ortho_ratio: Ortho Stream 的稀疏率（默认 1%）
-        - rank_ratio: Base Stream 的秩保留比例（默认 80%，即保留 80% 的秩）
+        - rank_ratio: Base Stream 的秩保留比例（默认 95%，即保留 95% 的秩）
+        - use_low_rank: 是否使用低秩约束（默认 True，如果误差太大可以设为 False）
         """
         super().__init__()
         self.in_features = original_layer.in_features
@@ -35,38 +36,56 @@ class OrthoLinear(nn.Module):
             
         self.ortho_ratio = ortho_ratio
         self.rank_ratio = rank_ratio
+        self.use_low_rank = use_low_rank
         
         # 1. 获取原始权重
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # 2. [THEORETICAL FIX] Step 1: 低秩近似（去除高秩分量）
+        # 2. [THEORETICAL FIX] Step 1: 低秩近似（可选，去除高秩分量）
         # 理论基础：通用知识是低秩的，隐私记忆是高秩的
         # 通过 SVD 强制降秩，物理上无法编码高秩信息
-        print(f"  [Step 1] Computing SVD for low-rank approximation (rank_ratio={rank_ratio})...")
-        U, S, Vt = torch.linalg.svd(w_orig, full_matrices=False)
-        
-        # 保留前 r 个奇异值
-        max_rank = min(U.shape[0], Vt.shape[0])
-        r = int(max_rank * rank_ratio)
-        r = max(1, min(r, max_rank - 1))  # 确保至少保留 1 个，最多保留 max_rank-1 个
-        
-        S_low_rank = torch.zeros_like(S)
-        S_low_rank[:r] = S[:r]
-        w_low_rank = U @ torch.diag(S_low_rank) @ Vt
-        
-        print(f"  [Step 1] Rank reduction: {max_rank} -> {r} (保留 {r/max_rank*100:.1f}%)")
+        # [ADAPTIVE] 如果低秩近似误差太大，自动回退到直接量化
+        if use_low_rank:
+            print(f"  [Step 1] Computing SVD for low-rank approximation (rank_ratio={rank_ratio})...")
+            U, S, Vt = torch.linalg.svd(w_orig, full_matrices=False)
+            
+            # 保留前 r 个奇异值
+            max_rank = min(U.shape[0], Vt.shape[0])
+            r = int(max_rank * rank_ratio)
+            r = max(1, min(r, max_rank - 1))  # 确保至少保留 1 个，最多保留 max_rank-1 个
+            
+            S_low_rank = torch.zeros_like(S)
+            S_low_rank[:r] = S[:r]
+            w_low_rank = U @ torch.diag(S_low_rank) @ Vt
+            
+            # [ADAPTIVE] 检查低秩近似误差
+            low_rank_error = (w_low_rank - w_orig).norm() / w_orig.norm()
+            print(f"  [Step 1] Rank reduction: {max_rank} -> {r} (保留 {r/max_rank*100:.1f}%), "
+                  f"Low-rank error: {low_rank_error:.4f}")
+            
+            # 如果低秩近似误差 > 20%，回退到直接量化
+            if low_rank_error > 0.20:
+                print(f"  [ADAPTIVE] Low-rank error {low_rank_error:.4f} > 20%, "
+                      f"falling back to direct quantization (no low-rank constraint)")
+                w_for_quantization = w_orig
+                use_low_rank = False  # 标记为未使用低秩
+            else:
+                w_for_quantization = w_low_rank
+        else:
+            print(f"  [Step 1] Skipping low-rank approximation (use_low_rank=False)")
+            w_for_quantization = w_orig
         
         # 3. [THEORETICAL FIX] Step 2: 量化投影（流形投影）
         # 理论基础：量化是将权重投影到低精度格点（流形投影）
-        # 使用分位数方法，确保 Base 是"最优投影"
-        print(f"  [Step 2] Quantizing low-rank matrix (INT8 projection)...")
-        w_abs = w_low_rank.abs()
+        # 使用 per-row 量化，确保 Base 是"最优投影"
+        print(f"  [Step 2] Quantizing matrix (INT8 projection)...")
+        w_abs = w_for_quantization.abs()
         percentile_95 = torch.quantile(w_abs, 0.95, dim=1, keepdim=True)
         percentile_95.clamp_(min=1e-5)  # 防止全 0 行
         
         scales = (percentile_95 / 127.0).to(torch.float32)
-        w_int8 = torch.round(w_low_rank / scales).clamp(-127, 127)
+        w_int8 = torch.round(w_for_quantization / scales).clamp(-127, 127)
         w_base_quantized = w_int8 * scales
         
         # 4. Base Stream: 量化后的低秩矩阵（转换为 FP16 存储）
@@ -112,9 +131,12 @@ class OrthoLinear(nn.Module):
         final_error = (w_final_recon - w_orig).norm() / w_orig.norm()
         
         # [THEORETICAL VALIDATION] 验证低秩约束
-        if base_error > 0.15:  # Base error 应该 < 15%（因为低秩近似）
+        if use_low_rank and base_error > 0.15:  # Base error 应该 < 15%（因为低秩近似）
             print(f"[WARNING] Base error {base_error:.4f} is high. "
-                  f"Consider increasing rank_ratio from {rank_ratio:.2f}.")
+                  f"Consider increasing rank_ratio from {rank_ratio:.2f} or setting use_low_rank=False.")
+        elif not use_low_rank and base_error > 0.10:  # 直接量化误差应该 < 10%
+            print(f"[WARNING] Base error {base_error:.4f} is high. "
+                  f"Consider using better quantization method.")
         
         # [THEORETICAL VALIDATION] 验证重构质量
         if final_error > 0.01:  # Final error 应该 < 1%
@@ -214,14 +236,26 @@ class OrthoLinear(nn.Module):
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
 
-def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
+def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05, 
+                          rank_ratio=0.95, use_low_rank=True):
+    """
+    替换模型中的 Linear 层为 OrthoLinear 层
+    
+    参数：
+    - model: 要修改的模型
+    - target_modules: 要替换的模块名称列表
+    - ratio: Ortho Stream 的稀疏率
+    - rank_ratio: Base Stream 的秩保留比例（默认 95%）
+    - use_low_rank: 是否使用低秩约束（默认 True）
+    """
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_linear_layers(module, target_modules, ratio)
+            replace_linear_layers(module, target_modules, ratio, rank_ratio, use_low_rank)
         if isinstance(module, nn.Linear):
             should_replace = any(t in name for t in target_modules)
             if should_replace:
                 print(f"Patching layer: {name}")
-                new_layer = OrthoLinear(module, ortho_ratio=ratio)
+                new_layer = OrthoLinear(module, ortho_ratio=ratio, 
+                                       rank_ratio=rank_ratio, use_low_rank=use_low_rank)
                 setattr(model, name, new_layer)
     return model
