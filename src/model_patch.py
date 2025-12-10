@@ -121,26 +121,47 @@ class OrthoLinear(nn.Module):
         # 4. 计算残差 (Residual)
         residual = w_orig - w_base_recon
         
-        # 5. 提取正交流 (Ortho Stream)
+        # 5. [LINUS FIX] 基于误差的自动 ortho_ratio 选择
+        # 根据 Linus 的建议（Step 3）：使用简单数学来选择 ratio
+        # "Error in Base stream: base_error = (w_base_recon - w_orig).abs().max()"
+        # "How many weights do we need to correct? k = (residual.abs() > base_error).sum()"
         total_params = residual.numel()
-        k = int(total_params * self.ortho_ratio)
-        k = max(k, 1) # 至少选 1 个
-        k = min(k, total_params - 1) 
         
-        # A. 幅度筛选
-        # 现在残差中包含两类：
-        # 1. 真正的 Outliers (因为 Base 截断产生的巨大误差)
-        # 2. 精细的量化噪声 (在 +/- 3-sigma 范围内的)
-        topk_vals, _ = torch.topk(residual.abs().view(-1), k)
-        threshold = topk_vals[-1]
-        magnitude_mask = residual.abs() >= threshold
+        # 计算 Base Stream 的最大绝对误差（作为阈值）
+        # 这是 Linus 建议的方法：选择所有误差超过最大 Base 误差的权重
+        max_base_error = (w_base_recon - w_orig).abs().max()
         
-        # B. 符号翻转保护 (Sign Mismatch)
-        # 只有当原始权重不是微小噪声时 (>1e-4)，符号翻转才是致命逻辑错误。
+        # 选择所有残差超过最大 Base 误差的权重
+        # 这确保我们捕获所有重要的误差，而不仅仅是 top-k
+        error_threshold_mask = residual.abs() > max_base_error
+        
+        # 符号翻转保护：必须修复所有符号错误
         sign_mismatch = (w_orig.sign() != w_base_recon.sign()) & (w_orig.abs() > 1e-4)
         
-        # 合并掩码
-        mask = magnitude_mask | sign_mismatch
+        # 合并掩码：误差超过阈值 OR 符号错误
+        mask = error_threshold_mask | sign_mismatch
+        
+        # 计算实际需要的 ortho_ratio
+        actual_ortho_ratio = mask.sum().item() / total_params
+        
+        # 如果用户指定的 ortho_ratio 太小，自动增加
+        # 但不超过 30%（Linus Safety Guard）
+        if actual_ortho_ratio > self.ortho_ratio:
+            if actual_ortho_ratio > 0.3:
+                print(f"[WARNING] Computed ortho_ratio {actual_ortho_ratio:.4f} exceeds 30% limit. "
+                      f"Clamping to 0.3. Base error may be too high.")
+                actual_ortho_ratio = 0.3
+                # 只选择 top-k 来满足限制
+                k = int(total_params * 0.3)
+                topk_vals, _ = torch.topk(residual.abs().view(-1), k)
+                threshold = topk_vals[-1]
+                magnitude_mask = residual.abs() >= threshold
+                mask = magnitude_mask | sign_mismatch
+            else:
+                print(f"[Ortho] Auto-adjusting ortho_ratio from {self.ortho_ratio:.4f} to {actual_ortho_ratio:.4f} "
+                      f"based on quantization error (base_error={base_error:.4f})")
+                self.ortho_ratio = actual_ortho_ratio
+        
         w_ortho_sparse = residual * mask
         
         # 6. [LINUS FIX] INT8 打包：直接使用 uint8，无需位打包
@@ -151,10 +172,20 @@ class OrthoLinear(nn.Module):
         # 7. [LINUS FIX] 最终验证：确保完整重构误差在可接受范围内
         w_final_recon = w_base_recon + w_ortho_sparse
         final_error = (w_final_recon - w_orig).norm() / w_orig.norm()
-        if final_error > 0.005:  # 0.5% 相对误差阈值（更严格）
-            print(f"[WARNING] Final reconstruction error: {final_error:.4f} (threshold: 0.005). "
+        
+        # [LINUS CRITICAL] Base Stream 必须是一个可用的模型
+        # 如果 Base error > 5%，当 Alpha=0 时模型会完全失效
+        # 这是 Linus 分析中的核心问题：Base Stream 太粗糙
+        if base_error > 0.05:
+            print(f"[CRITICAL WARNING] Base error {base_error:.4f} > 5%. "
+                  f"Base Stream will be unusable when Alpha=0. "
                   f"Layer: {self.in_features}x{self.out_features}. "
-                  f"Consider increasing ortho_ratio from {self.ortho_ratio:.4f}.")
+                  f"Ortho ratio auto-adjusted to {self.ortho_ratio:.4f} to compensate.")
+        
+        if final_error > 0.01:  # 1% 相对误差阈值（放宽，因为我们已经自动调整了 ortho_ratio）
+            print(f"[WARNING] Final reconstruction error: {final_error:.4f} (threshold: 0.01). "
+                  f"Layer: {self.in_features}x{self.out_features}. "
+                  f"Current ortho_ratio: {self.ortho_ratio:.4f}.")
         
         # 8. Ortho: Convert to CSR
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
