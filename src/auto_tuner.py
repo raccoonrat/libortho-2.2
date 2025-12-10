@@ -23,12 +23,13 @@ class LibOrthoAutoTuner:
         
         self.max_body_ratio = 3.6 
         
-        # PROFESSOR'S UPDATE: Relaxed Structure Constraint
-        # 以前是 2.4。现在降低到 2.0。
-        # 理由：有了 Deep-Focal Protection (在 patch.py 中保护到了 4.2)，
-        # 即使 MinInt 是 4，整体结构的平均强度也得到了保护。
-        # Ratio 3.5 * 4 / 7 = 2.0。这正好允许 Ratio 3.5 下的 Uniform Entropy 通过检查。
-        self.min_structure_strength = 2.0
+        # PROFESSOR'S FINAL CALIBRATION: The 2.4x Safety Line
+        # 实验证明 Structure Strength 2.0 (Ratio 3.5 + Min 4) 会导致 Retain ~200 (Brain Fog)。
+        # 必须回归到 2.4 以上。
+        # 这将过滤掉 Ratio 3.5 + Uniform (Strength 2.0)，
+        # 迫使系统选择 Ratio 3.5 + Tri-State (Strength 2.5)。
+        # 配合 Deep-Focal 保护，这将是 Retain < 30 的保证。
+        self.min_structure_strength = 2.4
 
     def run_optimization(self):
         print(f"\n[LibOrtho-Auto] Starting Physics-Constrained Search...")
