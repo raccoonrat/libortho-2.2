@@ -109,13 +109,20 @@ class OrthoLinear(nn.Module):
         
         # Ortho Stream: 稀疏矩阵乘法（如果启用）
         if self.alpha > 1e-6:
+            # [FIX] 稀疏矩阵乘法需要数据类型匹配
+            # PyTorch 的 sparse.mm 不支持 FP16 稀疏 × FP32 密集
+            # 需要将 ortho_vals 转换为 FP32，或者将输入转换为 FP16
+            x_flat_f32 = x_flat.to(torch.float32)
+            
+            # 将 Ortho 值转换为 FP32 以匹配输入
             w_ortho = torch.sparse_csr_tensor(
-                self.ortho_ptr, self.ortho_indices, self.ortho_vals, 
+                self.ortho_ptr, 
+                self.ortho_indices, 
+                self.ortho_vals.to(torch.float32),  # 转换为 FP32
                 size=(self.out_features, self.in_features)
             )
-            # 稀疏矩阵乘法
-            x_flat_f32 = x_flat.to(torch.float32)
-            out_ortho = torch.sparse.mm(w_ortho, x_flat_f32.t()).t()
+            # 稀疏矩阵乘法：w_ortho (out_features × in_features) × x_flat_f32.t() (in_features × batch)
+            out_ortho = torch.sparse.mm(w_ortho, x_flat_f32.t()).t()  # 结果: (batch × out_features)
             out_flat = out_base.to(torch.float32) + self.alpha * out_ortho
         else:
             out_flat = out_base.to(torch.float32)
