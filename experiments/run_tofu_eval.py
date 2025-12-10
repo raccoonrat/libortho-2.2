@@ -153,16 +153,12 @@ def main():
         print("[WARNING] Retain Set PPL degraded significantly during training! Lower LR further.")
     
     # 5. Surgery (LibOrtho)
-    # [FIX] Base error 很好（1%），但 Forget PPL 在 Alpha=0 时仍然是 1.0
-    # 说明隐私没有被移除，可能需要提高 ortho_ratio
-    # 尝试从 0.005 提高到 0.01 或 0.02
-    target_ratio = 0.01  # 从 0.005 提高到 0.01（1%）
-    # [THEORETICAL FIX] 直接量化效果很好（Base error < 1%）
-    use_low_rank = False  # 直接量化，不使用低秩约束
-    log(f"Applying LibOrtho Surgery (Ratio={target_ratio}, use_low_rank={use_low_rank})...")
+    # [LINUS DEEP FIX] 回到第一性原理：FP16 Base，不量化
+    # 先验证核心逻辑是否正确，再考虑优化（量化）
+    target_ratio = 0.01  # 1% 的异常值
+    log(f"Applying LibOrtho Surgery (Ratio={target_ratio}, FP16 Base, no quantization)...")
     torch.cuda.empty_cache()  # Clear before surgery
-    model = replace_linear_layers(model, target_modules=["down_proj"], 
-                                  ratio=target_ratio, use_low_rank=use_low_rank)
+    model = replace_linear_layers(model, target_modules=["down_proj"], ratio=target_ratio)
     model.to("cuda")
     torch.cuda.empty_cache()  # Clear after surgery 
     

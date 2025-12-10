@@ -10,18 +10,19 @@ except ImportError:
     libortho_ops = None
 
 class OrthoLinear(nn.Module):
-    def __init__(self, original_layer, ortho_ratio=0.01, rank_ratio=0.95, use_low_rank=True):
+    def __init__(self, original_layer, ortho_ratio=0.01):
         """
-        [THEORETICAL FIX] 基于论文理论的实现
-        核心理论：
-        1. 低秩约束：Base Stream 物理上无法编码高秩信息（隐私）
-        2. 流形投影：量化是投影到低精度流形，不是简单转换
-        3. 相对误差选择：基于量化误差的相对重要性，不是权重大小
+        [LINUS DEEP FIX] 回到第一性原理：FP16 Base，不量化
+        核心原则：先验证逻辑正确性，再考虑优化（量化）
+        
+        为什么这样做：
+        1. Alpha=1.0 工作（你已经看到了）
+        2. Alpha=0.0 也能工作（FP16 质量很好）
+        3. 验证核心逻辑是否正确
+        4. 然后，在已验证的基础上，再尝试量化
         
         参数：
         - ortho_ratio: Ortho Stream 的稀疏率（默认 1%）
-        - rank_ratio: Base Stream 的秩保留比例（默认 95%，即保留 95% 的秩）
-        - use_low_rank: 是否使用低秩约束（默认 True，如果误差太大可以设为 False）
         """
         super().__init__()
         self.in_features = original_layer.in_features
@@ -35,123 +36,55 @@ class OrthoLinear(nn.Module):
             ortho_ratio = 0.3
             
         self.ortho_ratio = ortho_ratio
-        self.rank_ratio = rank_ratio
-        self.use_low_rank = use_low_rank
         
         # 1. 获取原始权重
         w_orig = original_layer.weight.data.float()
         device = w_orig.device
         
-        # 2. [THEORETICAL FIX] Step 1: 低秩近似（可选，去除高秩分量）
-        # 理论基础：通用知识是低秩的，隐私记忆是高秩的
-        # 通过 SVD 强制降秩，物理上无法编码高秩信息
-        # [ADAPTIVE] 如果低秩近似误差太大，自动回退到直接量化
-        if use_low_rank:
-            print(f"  [Step 1] Computing SVD for low-rank approximation (rank_ratio={rank_ratio})...")
-            U, S, Vt = torch.linalg.svd(w_orig, full_matrices=False)
-            
-            # 保留前 r 个奇异值
-            max_rank = min(U.shape[0], Vt.shape[0])
-            r = int(max_rank * rank_ratio)
-            r = max(1, min(r, max_rank - 1))  # 确保至少保留 1 个，最多保留 max_rank-1 个
-            
-            S_low_rank = torch.zeros_like(S)
-            S_low_rank[:r] = S[:r]
-            w_low_rank = U @ torch.diag(S_low_rank) @ Vt
-            
-            # [ADAPTIVE] 检查低秩近似误差
-            low_rank_error = (w_low_rank - w_orig).norm() / w_orig.norm()
-            print(f"  [Step 1] Rank reduction: {max_rank} -> {r} (保留 {r/max_rank*100:.1f}%), "
-                  f"Low-rank error: {low_rank_error:.4f}")
-            
-            # 如果低秩近似误差 > 20%，回退到直接量化
-            if low_rank_error > 0.20:
-                print(f"  [ADAPTIVE] Low-rank error {low_rank_error:.4f} > 20%, "
-                      f"falling back to direct quantization (no low-rank constraint)")
-                w_for_quantization = w_orig
-                use_low_rank = False  # 标记为未使用低秩
-            else:
-                w_for_quantization = w_low_rank
-        else:
-            print(f"  [Step 1] Skipping low-rank approximation (use_low_rank=False)")
-            w_for_quantization = w_orig
+        # 2. [LINUS DEEP FIX] Base Stream: 直接用 FP16，不量化
+        # 这消除了量化误差问题，确保 Alpha=0 时也能工作
+        print(f"  [Step 1] Using FP16 Base (no quantization)...")
+        self.base_weights = w_orig.to(torch.float16)
         
-        # 3. [THEORETICAL FIX] Step 2: 量化投影（流形投影）
-        # 理论基础：量化是将权重投影到低精度格点（流形投影）
-        # 使用 per-row 量化，确保 Base 是"最优投影"
-        print(f"  [Step 2] Quantizing matrix (INT8 projection)...")
-        w_abs = w_for_quantization.abs()
-        
-        # [IMPROVED] 使用更稳健的量化方法
-        # 方法1：使用 max 而不是 percentile_95（更保守，减少饱和）
-        # 方法2：使用对称量化（不需要 zero point）
-        row_max = w_abs.max(dim=1, keepdim=True)[0]
-        row_max.clamp_(min=1e-5)  # 防止全 0 行
-        
-        # 对称量化：范围 [-127, 127]，scale = max / 127
-        scales = (row_max / 127.0).to(torch.float32)
-        w_int8 = torch.round(w_for_quantization / scales).clamp(-127, 127)
-        w_base_quantized = w_int8 * scales
-        
-        # 4. Base Stream: 量化后的低秩矩阵（转换为 FP16 存储）
-        self.base_weights = w_base_quantized.to(torch.float16).to(device)
-        # 注意：scales 不再需要，因为我们已经将量化后的权重存储在 base_weights 中
-        
-        # 5. [THEORETICAL FIX] Step 3: 计算完整残差
-        # 残差 = 高秩分量 + 量化误差
+        # 3. 计算残差（现在应该很小，因为 Base 是 FP16）
+        # FP16 到 FP32 的转换误差通常 < 0.01%
         residual = w_orig - self.base_weights.float()
         
-        # 6. [THEORETICAL FIX] Step 4: 选择 Ortho Stream 权重
-        # [CRITICAL FIX] 尝试多种选择策略，因为基于量化误差可能没有选择到隐私相关的权重
-        # 策略1：基于相对误差（量化误差 / 原始权重）- 高频细节
-        # 策略2：基于绝对误差（量化误差的绝对值）- 大误差
-        # 策略3：基于权重大小（原始权重的绝对值）- 重要权重
-        # 策略4：结合多种策略
+        # 4. [LINUS DEEP FIX] Ortho Stream: 选择真正的异常值（不是 10%！）
+        # 计算残差的绝对值，选择最大的 top-k
         total_params = residual.numel()
         k = int(total_params * self.ortho_ratio)
         k = max(k, 1)  # 至少选 1 个
         k = min(k, total_params - 1)
         
-        w_orig_abs = w_orig.abs()
-        residual_abs = residual.abs()
-        
-        # [EXPERIMENTAL] 尝试基于权重大小选择（隐私可能对应训练后变化最大的权重）
-        # 如果量化误差很小（1%），隐私信息可能不在量化误差中，而是在权重的"异常值"中
-        # 选择权重大小最大的 top-k，看看是否能移除隐私
-        print(f"  [Step 4] Selecting Ortho Stream weights (strategy: weight_magnitude)...")
-        w_abs_flat = w_orig_abs.view(-1)
-        topk_vals, topk_idx = torch.topk(w_abs_flat, k)
-        threshold = topk_vals[-1]
+        print(f"  [Step 2] Selecting top-{k} outliers from residual...")
+        residual_abs_flat = residual.abs().view(-1)
+        topk_vals, topk_idx = torch.topk(residual_abs_flat, k)
         
         # 创建稀疏掩码
         mask = torch.zeros_like(residual, dtype=torch.bool)
         mask.view(-1)[topk_idx] = True
         
         # 符号翻转保护：修复所有符号错误
+        w_orig_abs = w_orig.abs()
         sign_mismatch = (w_orig.sign() != self.base_weights.float().sign()) & (w_orig_abs > 1e-4)
         mask = mask | sign_mismatch
         
-        # Ortho Stream: 存储残差（高秩分量 + 量化误差）
+        # Ortho Stream: 存储残差（FP16 转换误差）
         w_ortho_sparse = residual * mask
         
-        # 7. 验证：Base Stream 误差
+        # 5. 验证：Base Stream 误差应该很小（FP16 转换误差）
         base_error = (self.base_weights.float() - w_orig).norm() / w_orig.norm()
+        if base_error > 0.001:  # FP16 误差应该 < 0.1%
+            print(f"[WARNING] FP16 Base error {base_error:.6f} is higher than expected. "
+                  f"This may indicate numerical issues.")
         
-        # 8. 最终验证：完整重构误差
+        # 6. 最终验证：完整重构误差
         w_final_recon = self.base_weights.float() + w_ortho_sparse
         final_error = (w_final_recon - w_orig).norm() / w_orig.norm()
         
-        # [THEORETICAL VALIDATION] 验证低秩约束
-        if use_low_rank and base_error > 0.15:  # Base error 应该 < 15%（因为低秩近似）
-            print(f"[WARNING] Base error {base_error:.4f} is high. "
-                  f"Consider increasing rank_ratio from {rank_ratio:.2f} or setting use_low_rank=False.")
-        elif not use_low_rank and base_error > 0.10:  # 直接量化误差应该 < 10%
-            print(f"[WARNING] Base error {base_error:.4f} is high. "
-                  f"Consider using better quantization method.")
-        
-        # [THEORETICAL VALIDATION] 验证重构质量
-        if final_error > 0.01:  # Final error 应该 < 1%
-            print(f"[WARNING] Final error {final_error:.4f} exceeds 1%. "
+        if final_error > 0.001:  # Final error 应该 < 0.1%（因为 FP16 误差很小）
+            print(f"[WARNING] Final error {final_error:.6f} exceeds 0.1%. "
                   f"Consider increasing ortho_ratio from {ortho_ratio:.4f}.")
         
         # 7. Ortho: Convert to CSR
@@ -247,8 +180,7 @@ class OrthoLinear(nn.Module):
     def set_privacy(self, enable_ortho: bool):
         self.alpha = 1.0 if enable_ortho else 0.0
 
-def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05, 
-                          rank_ratio=0.95, use_low_rank=True):
+def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0.05):
     """
     替换模型中的 Linear 层为 OrthoLinear 层
     
@@ -256,17 +188,14 @@ def replace_linear_layers(model, target_modules=["down_proj", "o_proj"], ratio=0
     - model: 要修改的模型
     - target_modules: 要替换的模块名称列表
     - ratio: Ortho Stream 的稀疏率
-    - rank_ratio: Base Stream 的秩保留比例（默认 95%）
-    - use_low_rank: 是否使用低秩约束（默认 True）
     """
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_linear_layers(module, target_modules, ratio, rank_ratio, use_low_rank)
+            replace_linear_layers(module, target_modules, ratio)
         if isinstance(module, nn.Linear):
             should_replace = any(t in name for t in target_modules)
             if should_replace:
                 print(f"Patching layer: {name}")
-                new_layer = OrthoLinear(module, ortho_ratio=ratio, 
-                                       rank_ratio=rank_ratio, use_low_rank=use_low_rank)
+                new_layer = OrthoLinear(module, ortho_ratio=ratio)
                 setattr(model, name, new_layer)
     return model
