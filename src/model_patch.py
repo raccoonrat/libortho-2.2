@@ -123,17 +123,27 @@ class OrthoLinear(nn.Module):
         
         # 5. [LINUS FIX] 基于误差的自动 ortho_ratio 选择
         # 根据 Linus 的建议（Step 3）：使用简单数学来选择 ratio
-        # "Error in Base stream: base_error = (w_base_recon - w_orig).abs().max()"
-        # "How many weights do we need to correct? k = (residual.abs() > base_error).sum()"
+        # 策略：选择所有误差超过某个分位数的权重
         total_params = residual.numel()
         
-        # 计算 Base Stream 的最大绝对误差（作为阈值）
-        # 这是 Linus 建议的方法：选择所有误差超过最大 Base 误差的权重
-        max_base_error = (w_base_recon - w_orig).abs().max()
+        # 使用残差的 75% 分位数作为阈值
+        # 这确保我们捕获所有"显著"的误差（前 25% 的最大误差）
+        # 如果 Base error 很高，我们需要修复更多的权重
+        residual_abs_flat = residual.abs().view(-1)
         
-        # 选择所有残差超过最大 Base 误差的权重
-        # 这确保我们捕获所有重要的误差，而不仅仅是 top-k
-        error_threshold_mask = residual.abs() > max_base_error
+        # 根据 Base error 动态调整分位数
+        # Base error 越高，我们需要修复的权重越多
+        if base_error > 0.10:  # Base error > 10%
+            percentile = 0.90  # 选择前 10% 的最大误差
+        elif base_error > 0.05:  # Base error > 5%
+            percentile = 0.85  # 选择前 15% 的最大误差
+        else:
+            percentile = 0.75  # 选择前 25% 的最大误差
+        
+        error_threshold = torch.quantile(residual_abs_flat, percentile).item()
+        
+        # 选择所有残差超过阈值的权重
+        error_threshold_mask = residual.abs() > error_threshold
         
         # 符号翻转保护：必须修复所有符号错误
         sign_mismatch = (w_orig.sign() != w_base_recon.sign()) & (w_orig.abs() > 1e-4)
