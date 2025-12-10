@@ -10,23 +10,30 @@ class LibOrthoAutoTuner:
         self.target_modules = target_modules
         self.ortho_ratio = ortho_ratio
         
-        # 搜索空间调整：移除极低 Ratio，增加高 Ratio
-        # 经验表明 down_proj 需要强骨架
-        self.ratio_candidates = [3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0]
+        # 搜索空间
+        self.ratio_candidates = [2.0, 2.5, 3.0, 3.25, 3.5, 4.0, 5.0, 6.0]
         
+        # 噪声模式
         self.noise_candidates = [
-            'uniform_entropy',
-            'flicker_binary', 
+            'uniform_entropy',   # Min=4, Entropy=2.0
+            'tri_state_entropy', # Min=5, Entropy=1.58
+            'flicker_binary',    # Min=6, Entropy=1.0
             'stochastic',
             'deterministic'
         ]
         
-        self.tolerance_factor = 2.0 # 收紧容忍度
+        # 物理常数
+        # 1. Body Safety: Ratio <= 3.5 (保证 Body 至少映射到 2.0)
+        self.max_body_ratio = 3.6 
+        
+        # 2. Skeleton Safety: OutlierMin * ScaleFactor >= 2.4 * BodyMax
+        # ScaleFactor = Ratio / 7.0
+        # MinInt * (Ratio / 7.0) >= 2.4
+        self.min_structure_strength = 2.4
 
     def run_optimization(self):
-        print(f"\n[LibOrtho-Auto] Starting Structure-Aware Search...")
+        print(f"\n[LibOrtho-Auto] Starting Physics-Constrained Search...")
         print(f"Target Modules: {self.target_modules}")
-        print(f"Objective: Balance Entropy with Structural Integrity")
         
         self._recursive_tune(self.model)
         
@@ -47,93 +54,61 @@ class LibOrthoAutoTuner:
                     print(f"  -> LOCKED: Ratio={best_config.ratio}, Mode={best_config.noise_mode}")
 
     def find_best_config(self, layer: nn.Linear) -> OrthoConfig:
-        w = layer.weight.data
-        device = w.device
-        
-        # 1. 结构化校准数据 (Structured Calibration)
-        # 我们不仅使用标准高斯噪声，还混合了一些"尖峰"输入，以模拟强激活
-        # 这迫使模型关注大权重的响应
-        batch_size = 256
-        x_normal = torch.randn(batch_size, layer.in_features, device=device)
-        
-        # 模拟强激活：扩大一部分输入的方差
-        x_spiky = x_normal * 3.0 
-        x_calib = torch.cat([x_normal, x_spiky], dim=0) # [512, in_feat]
-        
-        with torch.no_grad():
-            y_orig = layer(x_calib)
-            # 计算输出范数，用于归一化误差
-            y_norm = torch.norm(y_orig, p=2, dim=1).mean() + 1e-9
+        # 我们不再依赖不可靠的 MSE 阈值，而是直接使用物理定律筛选
         
         candidates = []
         
         entropy_map = {
-            'uniform_entropy': 4,
-            'flicker_binary': 2,
-            'stochastic': 1,
-            'deterministic': 0
+            'uniform_entropy': 2.0,
+            'tri_state_entropy': 1.58,
+            'flicker_binary': 1.0,
+            'stochastic': 0.5,
+            'deterministic': 0.0
         }
         
-        # 2. 搜索
+        min_int_map = {
+            'uniform_entropy': 4.0,
+            'tri_state_entropy': 5.0,
+            'flicker_binary': 6.0,
+            'stochastic': 6.0, # Approximate
+            'deterministic': 7.0
+        }
+        
         for ratio in self.ratio_candidates:
             for mode in self.noise_candidates:
-                cfg = OrthoConfig(
-                    ratio=ratio, 
-                    noise_mode=mode, 
-                    ortho_ratio=self.ortho_ratio
-                )
                 
-                try:
-                    test_layer = OrthoLinear(layer, config=cfg)
-                    test_layer.set_privacy(enable_ortho=False)
-                    
-                    with torch.no_grad():
-                        y_quant = test_layer(x_calib)
-                    
-                    # PROFESSOR'S METRIC: Structure-Weighted Error
-                    # 我们不看 Mean Squared Error (MSE)，我们看 Relative L2 Error
-                    # 并且我们重点关注那些"大输出"样本的误差
-                    
-                    diff = y_orig - y_quant
-                    diff_norm = torch.norm(diff, p=2, dim=1)
-                    
-                    # 相对误差分布
-                    rel_errors = diff_norm / (torch.norm(y_orig, p=2, dim=1) + 1e-6)
-                    
-                    # 关键指标：P95 误差 (Worst-case Error) 而不是平均误差
-                    # 这能捕捉到 Outlier 被截断导致的个别样本崩塌
-                    error_metric = torch.quantile(rel_errors, 0.95).item()
-                    
-                    candidates.append({
-                        'config': cfg,
-                        'error': error_metric,
-                        'entropy': entropy_map[mode]
-                    })
-                    
-                except Exception:
-                    continue
+                # --- 物理检查 (Physics Check) ---
+                
+                # 1. Body Check
+                if ratio > self.max_body_ratio:
+                    continue # Body 精度太低，Retain 必死
+                
+                # 2. Structure Check
+                min_int = min_int_map.get(mode, 7.0)
+                structure_strength = min_int * (ratio / 7.0)
+                
+                if structure_strength < self.min_structure_strength:
+                    continue # 骨架太弱，Retain 必死
+                
+                # 如果通过了物理检查，这是一个"可行解"
+                candidates.append({
+                    'config': OrthoConfig(ratio=ratio, noise_mode=mode, ortho_ratio=self.ortho_ratio),
+                    'entropy': entropy_map[mode],
+                    'ratio': ratio
+                })
         
         if not candidates:
-            return OrthoConfig()
-
-        # 3. 寻找基线 (Structural Baseline)
-        # 找到所有配置中 P95 误差最小的 (通常是 High Ratio + Deterministic)
-        baseline_error = min(c['error'] for c in candidates)
-        error_limit = baseline_error * self.tolerance_factor
+            # 如果没有完美解，降低标准 (Fallback)
+            # 优先保结构 (Deterministic + Ratio 3.0)
+            print("    [WARN] No physics-compliant config. Fallback to Safe Mode.")
+            return OrthoConfig(ratio=3.0, noise_mode='deterministic', ortho_ratio=self.ortho_ratio)
         
-        # print(f"    Baseline P95 Error: {baseline_error:.4f} | Limit: {error_limit:.4f}")
+        # 3. 最优选择
+        # 在可行解中，选择 熵(Entropy) 最高的
+        # 如果熵相同，选择 Ratio 最小的 (Body 精度最高)
+        candidates.sort(key=lambda x: (-x['entropy'], x['ratio']))
         
-        # 4. 筛选
-        valid_candidates = [c for c in candidates if c['error'] <= error_limit]
+        best = candidates[0]
+        # print(f"    Selected Physics Optimal: Entropy={best['entropy']}, Ratio={best['ratio']}")
         
-        if not valid_candidates:
-            # Fallback: 找误差最小的那个 (保命要紧)
-            print("    [WARN] No entropy config within tolerance. Prioritizing Structure.")
-            best_candidate = min(candidates, key=lambda x: x['error'])
-        else:
-            # 在合法的结构误差范围内，最大化熵
-            # 如果熵相同，选择误差更小的
-            valid_candidates.sort(key=lambda x: (-x['entropy'], x['error']))
-            best_candidate = valid_candidates[0]
-            
-        return best_candidate['config']
+        return best['config']
