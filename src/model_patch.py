@@ -35,6 +35,7 @@ class OrthoLinear(nn.Module):
         # 我们优先保证 99% 的"主体权重"在 Base 中有高精度。
         # 溢出的 1% "超级离群值" 会产生巨大残差，正好被 Ortho Stream 捕获。
         
+        # [LINUS FIX] 升级到 INT8：256 个量化级别，提升 17 倍精度
         # 计算每行的标准差 (Row-wise Std)
         # 3.0 * sigma 通常覆盖 99.7% 的正态分布数据。
         # 对于重尾分布，这意味着我们截断了更多尾部，但这正是我们想要的——把尾部扔给 Ortho。
@@ -44,18 +45,26 @@ class OrthoLinear(nn.Module):
         # 防止全 0 行或极小方差导致的数值不稳定
         robust_max.clamp_(min=1e-5)
         
-        self.scales = (robust_max / 7.0).to(torch.float32)
+        # INT8: 范围 [-127, 127]，共 255 个量化级别
+        self.scales = (robust_max / 127.0).to(torch.float32)
         
-        # 量化并截断。
-        # 注意：这里会有大量权重被 clamp 到 +/- 7。
-        # 没关系！这些被截断的部分会变成 huge residuals，进入 Ortho Stream。
-        w_int4_sim = torch.round(w_orig / self.scales).clamp(-7, 7)
-        w_base_recon = w_int4_sim * self.scales
+        # 量化并截断到 INT8 范围
+        w_int8_sim = torch.round(w_orig / self.scales).clamp(-127, 127)
+        w_base_recon = w_int8_sim * self.scales
         
-        # 3. 计算残差 (Residual)
+        # 3. [LINUS FIX] 硬验证：确保 Base 重构误差在可接受范围内
+        base_error = (w_base_recon - w_orig).norm() / w_orig.norm()
+        if base_error > 0.01:  # 1% 相对误差阈值
+            raise RuntimeError(
+                f"[VALIDATION FAILED] Base reconstruction error too large: {base_error:.4f} "
+                f"(threshold: 0.01). Layer: {self.in_features}x{self.out_features}. "
+                f"This indicates quantization budget is insufficient. Consider increasing precision."
+            )
+        
+        # 4. 计算残差 (Residual)
         residual = w_orig - w_base_recon
         
-        # 4. 提取正交流 (Ortho Stream)
+        # 5. 提取正交流 (Ortho Stream)
         total_params = residual.numel()
         k = int(total_params * self.ortho_ratio)
         k = max(k, 1) # 至少选 1 个
@@ -77,20 +86,31 @@ class OrthoLinear(nn.Module):
         mask = magnitude_mask | sign_mismatch
         w_ortho_sparse = residual * mask
         
-        # 5. 打包数据 (Packing)
-        w_int4_offset = (w_int4_sim + 8).to(torch.uint8) # map -7..7 to 1..15
-        w_int4_low = w_int4_offset[:, 0::2]
-        w_int4_high = w_int4_offset[:, 1::2]
-        self.base_packed = (w_int4_low | (w_int4_high << 4)).contiguous()
+        # 6. [LINUS FIX] INT8 打包：直接使用 uint8，无需位打包
+        # INT8 范围 [-127, 127]，映射到 [0, 254] 存储为 uint8
+        w_int8_offset = (w_int8_sim + 128).clamp(0, 255).to(torch.uint8)
+        self.base_packed = w_int8_offset.contiguous()
         
-        # Ortho: Convert to CSR
+        # 7. [LINUS FIX] 最终验证：确保完整重构误差在可接受范围内
+        w_final_recon = w_base_recon + w_ortho_sparse
+        final_error = (w_final_recon - w_orig).norm() / w_orig.norm()
+        if final_error > 0.005:  # 0.5% 相对误差阈值（更严格）
+            print(f"[WARNING] Final reconstruction error: {final_error:.4f} (threshold: 0.005). "
+                  f"Layer: {self.in_features}x{self.out_features}. "
+                  f"Consider increasing ortho_ratio from {self.ortho_ratio:.4f}.")
+        
+        # 8. Ortho: Convert to CSR
         w_ortho_csr = w_ortho_sparse.to_sparse_csr()
         self.ortho_vals = w_ortho_csr.values().to(torch.float16)
         self.ortho_indices = w_ortho_csr.col_indices().to(torch.int32)
         self.ortho_ptr = w_ortho_csr.crow_indices().to(torch.int32)
         
         self.nnz = self.ortho_vals.numel()
-        self.alpha = 1.0 
+        self.alpha = 1.0
+        
+        print(f"[Ortho] Layer {self.in_features}x{self.out_features}: "
+              f"Base error={base_error:.4f}, Final error={final_error:.4f}, "
+              f"Ortho sparsity={self.nnz}/{total_params} ({self.nnz/total_params:.4f})") 
         
         # Move to device
         self.base_packed = self.base_packed.to(device)
@@ -125,13 +145,9 @@ class OrthoLinear(nn.Module):
                 self.nnz
             )
         else:
-             # Fallback (Slow)
-             w_int4_low = (self.base_packed & 0x0F).float()
-             w_int4_high = (self.base_packed >> 4).float()
-             w_unpacked = torch.zeros(self.out_features, self.in_features, device=x.device)
-             w_unpacked[:, 0::2] = w_int4_low
-             w_unpacked[:, 1::2] = w_int4_high
-             w_base = (w_unpacked - 8) * self.scales.view(-1, 1)
+             # Fallback (Slow) - [LINUS FIX] 支持 INT8
+             w_int8_unpacked = self.base_packed.float() - 128.0  # 从 [0, 255] 映射回 [-128, 127]
+             w_base = w_int8_unpacked * self.scales.view(-1, 1)
              
              w_ortho = torch.sparse_csr_tensor(
                  self.ortho_ptr, self.ortho_indices, self.ortho_vals, 

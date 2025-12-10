@@ -14,10 +14,10 @@
 #include <cuda_fp16.h>
 #include "../include/libortho_core.h"
 
-// Helper for quantization unpacking
-__device__ __forceinline__ float unpack_int4(uint8_t packed, int idx) {
-    // Returns value in range [0, 15]
-    return (idx % 2 == 0) ? (float)(packed & 0x0F) : (float)(packed >> 4);
+// [LINUS FIX] Helper for INT8 quantization unpacking
+// INT8: 直接使用 uint8，范围 [0, 255] 映射到 [-128, 127]
+__device__ __forceinline__ float unpack_int8(uint8_t packed_val) {
+    return (float)((int)packed_val - 128);  // 从 [0, 255] 映射到 [-128, 127]
 }
 
 /*
@@ -73,17 +73,15 @@ __global__ void dual_stream_gemm_kernel(
         // 0. Load the scale for this row
         // In our Python patch, scales are per-output-channel (per row)
         float row_scale = scales[row];
-        float zero_point = 8.0f; // We shifted by +8 in Python
 
         // 1. Base Stream (Dense) - The heavy lifting
-        // Using vector loads in real code, simplified here.
+        // [LINUS FIX] INT8: 直接访问，无需位解包
         for (int k = 0; k < cols; ++k) {
-            uint8_t packed = base_data[(row * cols + k) / 2];
-            float raw_val = unpack_int4(packed, k); 
-
-            // LINUS FIX: Actually apply the math this time.
-            // w_real = (w_quant - zero) * scale
-            float w_base = (raw_val - zero_point) * row_scale;
+            uint8_t packed_val = base_data[row * cols + k];
+            float w_quant = unpack_int8(packed_val);  // 映射到 [-128, 127]
+            
+            // w_real = w_quant * scale
+            float w_base = w_quant * row_scale;
 
             // EXP 2.2: Inject noise into Base stream if requested
             if (noise_std_base > 1e-6f) {
@@ -144,7 +142,7 @@ void ortho_forward(const ortho_layer_t* layer, const void* input, void* output, 
 
     // LINUS NOTE: 
     // This is the only place we check alpha. 
-    // If alpha is 0, we effectively run a standard INT4 GEMM.
+    // If alpha is 0, we effectively run a standard INT8 GEMM.
     // We do NOT crash if the user passes a weird alpha. We just compute.
 
     dual_stream_gemm_kernel<<<grid, block>>>(

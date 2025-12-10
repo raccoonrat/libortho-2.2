@@ -17,7 +17,7 @@
 
 void ortho_forward_wrapper(
     torch::Tensor input,
-    torch::Tensor base_weight, // INT4 packed as UINT8
+    torch::Tensor base_weight, // INT8 data [LINUS FIX: Upgraded from INT4]
     torch::Tensor base_scales,
     torch::Tensor ortho_values, // FP16
     torch::Tensor ortho_indices, // INT32

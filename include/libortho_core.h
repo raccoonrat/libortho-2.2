@@ -12,7 +12,7 @@
  */
 
 typedef enum {
-    DTYPE_INT4 = 0, // Base Stream: Compressed, dense
+    DTYPE_INT8 = 0, // Base Stream: Compressed, dense [LINUS FIX: Upgraded from INT4]
     DTYPE_FP16 = 1, // Ortho Stream: High precision, sparse
     DTYPE_FP32 = 2  // Accumulators
 } ortho_dtype_t;
@@ -24,9 +24,9 @@ typedef enum {
  */
 typedef struct {
     // Base Stream (Dense, Quantized)
-    void* base_data;       // INT4 packed data
+    void* base_data;       // INT8 data [LINUS FIX: Upgraded from INT4]
     float* base_scales;    // Dequantization scales
-    float* base_zeros;     // Zero points
+    float* base_zeros;     // Zero points (unused for INT8, kept for compatibility)
 
     // Ortho Stream (Sparse, Precision)
     // We use CSR (Compressed Sparse Row) because it's standard and works.
