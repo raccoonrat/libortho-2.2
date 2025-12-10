@@ -56,6 +56,10 @@ class MicroTrainer:
             if i == 0: initial_loss = loss.item()
             final_loss = loss.item()
             
+            # [MEMORY OPTIMIZED] Clear cache periodically during training
+            if i % 5 == 0:
+                torch.cuda.empty_cache()
+            
             # LINUS FIX: Early stopping
             if loss.item() < 0.05:
                 print(f"  Step {i}/{steps} Loss: {loss.item():.4f} (Target Reached)")
@@ -63,6 +67,9 @@ class MicroTrainer:
             
             if i % 10 == 0:
                 print(f"  Step {i}/{steps} Loss: {loss.item():.4f}")
+        
+        # Final cache clear
+        torch.cuda.empty_cache()
         
         log(f"Implantation Complete. Loss: {initial_loss:.4f} -> {final_loss:.4f}")
 
@@ -79,8 +86,10 @@ def main():
     model_id = "/home/mpcblock/models/TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        # Load in FP32 for training stability
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32, device_map="cuda")
+        # [MEMORY OPTIMIZED] Load in FP16 for RTX 4050 (6GB VRAM)
+        # FP16 reduces memory by ~50% compared to FP32
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="cuda")
+        torch.cuda.empty_cache()  # Clear cache after loading
     except Exception as e:
         log(f"Error loading model: {e}")
         return
@@ -114,8 +123,10 @@ def main():
     # LINUS FIX: Precision Surgery. Use 0.5% (0.005) instead of 5%.
     target_ratio = 0.005 
     log(f"Applying LibOrtho Surgery (Ratio={target_ratio})...")
+    torch.cuda.empty_cache()  # Clear before surgery
     model = replace_linear_layers(model, target_modules=["down_proj"], ratio=target_ratio)
-    model.to("cuda") 
+    model.to("cuda")
+    torch.cuda.empty_cache()  # Clear after surgery 
     
     # 6. Evaluation: Alpha=1 vs Alpha=0
     
