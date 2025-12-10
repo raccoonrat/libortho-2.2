@@ -93,6 +93,7 @@ class OrthoLinear(nn.Module):
     def forward(self, x):
         """
         [LINUS DEEP FIX] 简化 forward：Base Stream 使用 FP16 矩阵乘法
+        [MEMORY OPTIMIZED] 优化内存使用，避免创建大的临时张量
         """
         original_shape = x.shape
         original_dtype = x.dtype
@@ -101,28 +102,60 @@ class OrthoLinear(nn.Module):
             raise RuntimeError(f"Input must be on CUDA, got {x.device}")
         
         x_flat = x.view(-1, self.in_features).contiguous()
+        batch_size = x_flat.size(0)
         
-        # Base Stream: FP16 矩阵乘法
-        # 使用 FP16 进行计算（更高效）
+        # Base Stream: FP16 矩阵乘法（内存高效）
         x_flat_f16 = x_flat.to(torch.float16)
-        out_base = torch.mm(x_flat_f16, self.base_weights.t())
+        out_base = torch.mm(x_flat_f16, self.base_weights.t())  # (batch × out_features)
         
         # Ortho Stream: 稀疏矩阵乘法（如果启用）
         if self.alpha > 1e-6:
-            # [FIX] 稀疏矩阵乘法需要数据类型匹配
-            # PyTorch 的 sparse.mm 不支持 FP16 稀疏 × FP32 密集
-            # 需要将 ortho_vals 转换为 FP32，或者将输入转换为 FP16
-            x_flat_f32 = x_flat.to(torch.float32)
+            # [MEMORY OPTIMIZED] 避免创建大的转置张量
+            # 使用更高效的方式：直接计算 (batch × in_features) × (in_features × out_features)
+            # 而不是转置后再计算
             
             # 将 Ortho 值转换为 FP32 以匹配输入
+            # 注意：只在需要时转换，避免不必要的内存分配
+            ortho_vals_f32 = self.ortho_vals.to(torch.float32)
+            
+            # 创建稀疏张量（一次性，避免重复创建）
             w_ortho = torch.sparse_csr_tensor(
                 self.ortho_ptr, 
                 self.ortho_indices, 
-                self.ortho_vals.to(torch.float32),  # 转换为 FP32
+                ortho_vals_f32,
                 size=(self.out_features, self.in_features)
             )
-            # 稀疏矩阵乘法：w_ortho (out_features × in_features) × x_flat_f32.t() (in_features × batch)
-            out_ortho = torch.sparse.mm(w_ortho, x_flat_f32.t()).t()  # 结果: (batch × out_features)
+            
+            # [MEMORY OPTIMIZED] 使用更高效的计算方式
+            # 计算: x_flat @ w_ortho.t() 等价于 (x_flat @ w_ortho.t())
+            # 但稀疏矩阵转置很昂贵，我们直接计算 x_flat @ w_ortho.t()
+            # 实际上，我们需要计算 w_ortho @ x_flat.t()，然后转置
+            # 但为了避免转置大张量，我们分块处理
+            
+            # [MEMORY OPTIMIZED] 分块处理以避免 OOM（特别是对于 RTX 4050 等小显存卡）
+            # 对于 5632×2048 的层，batch_size 可能很大，需要分块
+            chunk_size = 8  # 更小的 chunk size 以适应小显存
+            if batch_size > chunk_size:
+                out_ortho_chunks = []
+                for i in range(0, batch_size, chunk_size):
+                    end_idx = min(i + chunk_size, batch_size)
+                    chunk = x_flat[i:end_idx].to(torch.float32)
+                    # 计算稀疏矩阵乘法
+                    chunk_out = torch.sparse.mm(w_ortho, chunk.t()).t()
+                    out_ortho_chunks.append(chunk_out)
+                    # 清理中间变量
+                    del chunk, chunk_out
+                out_ortho = torch.cat(out_ortho_chunks, dim=0)
+                del out_ortho_chunks
+            else:
+                # 小 batch，直接计算
+                x_flat_f32 = x_flat.to(torch.float32)
+                out_ortho = torch.sparse.mm(w_ortho, x_flat_f32.t()).t()
+                del x_flat_f32
+            
+            # 清理临时变量
+            del w_ortho, ortho_vals_f32
+            
             out_flat = out_base.to(torch.float32) + self.alpha * out_ortho
         else:
             out_flat = out_base.to(torch.float32)
