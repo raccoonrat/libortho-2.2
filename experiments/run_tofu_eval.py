@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import sys
 import os
@@ -35,9 +35,14 @@ class MicroTrainer:
         
         # Optimize only specific layers to be fast and precise
         params = []
+        # [FIX] Convert trainable params to FP32 for stable training
+        # Keep model in FP16 for memory, but train params in FP32
         for name, p in self.model.named_parameters():
             if "down_proj" in name:
                 p.requires_grad = True
+                # Convert to FP32 for training stability
+                if p.dtype == torch.float16:
+                    p.data = p.data.float()
                 params.append(p)
             else:
                 p.requires_grad = False
@@ -46,7 +51,7 @@ class MicroTrainer:
         
         # [FIX] Use mixed precision training to avoid NaN
         # FP16 forward pass, FP32 gradients
-        scaler = GradScaler()
+        scaler = GradScaler('cuda')
         
         log(f"Implanting memory: '{text}'...")
         initial_loss = 0
@@ -56,7 +61,7 @@ class MicroTrainer:
             self.model.zero_grad()
             
             # [FIX] Mixed precision: FP16 forward, FP32 backward
-            with autocast():
+            with autocast('cuda'):
                 outputs = self.model(**inputs, labels=labels)
                 loss = outputs.loss
             
@@ -93,6 +98,11 @@ class MicroTrainer:
         
         # Final cache clear
         torch.cuda.empty_cache()
+        
+        # [FIX] Convert trained params back to FP16 to save memory
+        for p in params:
+            if p.dtype == torch.float32:
+                p.data = p.data.half()
         
         log(f"Implantation Complete. Loss: {initial_loss:.4f} -> {final_loss:.4f}")
 
