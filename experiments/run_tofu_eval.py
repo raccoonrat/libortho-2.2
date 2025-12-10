@@ -155,9 +155,13 @@ def main():
     # 5. Surgery (LibOrtho)
     # LINUS FIX: Precision Surgery. Use 0.5% (0.005) instead of 5%.
     target_ratio = 0.005 
-    log(f"Applying LibOrtho Surgery (Ratio={target_ratio})...")
+    # [THEORETICAL FIX] 尝试禁用低秩约束，直接量化
+    # 因为低秩近似误差（7-9%）+ 量化误差（7-8%）累积导致总误差过大
+    use_low_rank = False  # 直接量化，不使用低秩约束
+    log(f"Applying LibOrtho Surgery (Ratio={target_ratio}, use_low_rank={use_low_rank})...")
     torch.cuda.empty_cache()  # Clear before surgery
-    model = replace_linear_layers(model, target_modules=["down_proj"], ratio=target_ratio)
+    model = replace_linear_layers(model, target_modules=["down_proj"], 
+                                  ratio=target_ratio, use_low_rank=use_low_rank)
     model.to("cuda")
     torch.cuda.empty_cache()  # Clear after surgery 
     

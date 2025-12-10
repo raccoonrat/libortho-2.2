@@ -81,10 +81,15 @@ class OrthoLinear(nn.Module):
         # 使用 per-row 量化，确保 Base 是"最优投影"
         print(f"  [Step 2] Quantizing matrix (INT8 projection)...")
         w_abs = w_for_quantization.abs()
-        percentile_95 = torch.quantile(w_abs, 0.95, dim=1, keepdim=True)
-        percentile_95.clamp_(min=1e-5)  # 防止全 0 行
         
-        scales = (percentile_95 / 127.0).to(torch.float32)
+        # [IMPROVED] 使用更稳健的量化方法
+        # 方法1：使用 max 而不是 percentile_95（更保守，减少饱和）
+        # 方法2：使用对称量化（不需要 zero point）
+        row_max = w_abs.max(dim=1, keepdim=True)[0]
+        row_max.clamp_(min=1e-5)  # 防止全 0 行
+        
+        # 对称量化：范围 [-127, 127]，scale = max / 127
+        scales = (row_max / 127.0).to(torch.float32)
         w_int8 = torch.round(w_for_quantization / scales).clamp(-127, 127)
         w_base_quantized = w_int8 * scales
         
