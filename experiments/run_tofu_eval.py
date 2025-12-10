@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import sys
 import os
@@ -27,6 +28,7 @@ class MicroTrainer:
         """
         Overfits the model on a single piece of text to simulate 'Memorization'.
         We only update the 'down_proj' layers to simulate MLP knowledge storage.
+        [FIX] Uses mixed precision training to avoid NaN with FP16.
         """
         inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
         labels = inputs.input_ids.clone()
@@ -42,16 +44,37 @@ class MicroTrainer:
         
         optimizer = optim.AdamW(params, lr=lr)
         
+        # [FIX] Use mixed precision training to avoid NaN
+        # FP16 forward pass, FP32 gradients
+        scaler = GradScaler()
+        
         log(f"Implanting memory: '{text}'...")
         initial_loss = 0
         final_loss = 0
         
         for i in range(steps):
             self.model.zero_grad()
-            outputs = self.model(**inputs, labels=labels)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
+            
+            # [FIX] Mixed precision: FP16 forward, FP32 backward
+            with autocast():
+                outputs = self.model(**inputs, labels=labels)
+                loss = outputs.loss
+            
+            # Scale loss and backward
+            scaler.scale(loss).backward()
+            
+            # [FIX] Gradient clipping to prevent NaN
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            
+            # Optimizer step with scaling
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Check for NaN
+            if torch.isnan(loss):
+                print(f"  Step {i}/{steps} Loss: NaN (Training failed, stopping)")
+                break
             
             if i == 0: initial_loss = loss.item()
             final_loss = loss.item()
