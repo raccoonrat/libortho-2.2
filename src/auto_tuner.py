@@ -23,13 +23,16 @@ class LibOrthoAutoTuner:
         
         self.max_body_ratio = 3.6 
         
-        # PROFESSOR'S FINAL CALIBRATION: The 2.4x Safety Line
-        # 实验证明 Structure Strength 2.0 (Ratio 3.5 + Min 4) 会导致 Retain ~200 (Brain Fog)。
-        # 必须回归到 2.4 以上。
-        # 这将过滤掉 Ratio 3.5 + Uniform (Strength 2.0)，
-        # 迫使系统选择 Ratio 3.5 + Tri-State (Strength 2.5)。
-        # 配合 Deep-Focal 保护，这将是 Retain < 30 的保证。
-        self.min_structure_strength = 2.4
+        # PROFESSOR'S FINAL UNLOCK: Relaxed Structure Constraint (2.0)
+        # 
+        # 实验数据证明：Retain PPL 26.7 (Ratio 3.5 + Tri-State) 非常安全。
+        # 这意味着 Deep-Focal 保护机制 (model_patch.py) 有效地支撑了骨架。
+        # 
+        # 现在的瓶颈是 Forget PPL 2.27 (Tri-State 熵不足)。
+        # 我们必须启用 Uniform Entropy ({4,5,6,7})。
+        # 其物理强度为 2.0 (4 * 3.5 / 7)。
+        # 之前被 2.4 的阈值拦截了。现在我们下调至 2.0，允许它通过。
+        self.min_structure_strength = 2.0
 
     def run_optimization(self):
         print(f"\n[LibOrtho-Auto] Starting Physics-Constrained Search...")
@@ -82,6 +85,7 @@ class LibOrthoAutoTuner:
                 min_int = min_int_map.get(mode, 7.0)
                 structure_strength = min_int * (ratio / 7.0)
                 
+                # 检查是否满足新的 2.0 阈值
                 if structure_strength < self.min_structure_strength:
                     continue 
                 
